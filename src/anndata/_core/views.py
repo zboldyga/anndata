@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import reduce, singledispatch
@@ -28,12 +27,12 @@ from ..compat import (
     has_xp_base,
     pandas_no_chained_assignment_warning,
 )
-from ..utils import warn
+from ..utils import set_module, warn
 from .access import ElementRef
 from .xarray import Dataset2D
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
     from typing import Any, ClassVar
 
     from numpy.typing import NDArray
@@ -297,6 +296,7 @@ class DictView(_ViewMixin, dict):
     pass
 
 
+@set_module("anndata.experimental")
 class DataFrameView(_ViewMixin, pd.DataFrame):
     """A :class:`pandas.DataFrame` that is a view of an attribute of an :class:`~anndata.AnnData` view.
 
@@ -525,7 +525,7 @@ def resolve_idx(
     old: _Index1DNorm,
     new: _Index1DNorm | int | np.integer | Sequence[int] | Sequence[bool],
     length: int,
-) -> _Index1DNorm | np.integer:
+) -> _Index1DNorm | int:
     """Compose two consecutive 1D indices into one index relative to the original axis.
 
     When a view of a view is created, the indices of both subsetting operations
@@ -543,6 +543,8 @@ def resolve_idx(
         Index relative to the subset created by `old`.
         Can be any of the types accepted for `old`,
         an integer, or a sequence of integers or booleans.
+        Arrays, scalars and sequences are converted to the array namespace of `old`
+        (e.g. a :class:`numpy.ndarray` is converted when `old` is a JAX array).
     length
         Length of the axis of the original object.
         Only used to resolve slices.
@@ -552,7 +554,7 @@ def resolve_idx(
     A single index relative to the original axis.
     Composing two slices yields a :class:`slice`,
     composing two boolean masks yields a boolean mask,
-    and indexing with an integer yields an integer.
+    and indexing with an integer yields an :class:`int`.
 
     Raises
     ------
@@ -567,6 +569,8 @@ def resolve_idx(
     slice(2, 8, 2)
     >>> resolve_idx(np.array([1, 3, 5]), [2, 0], 6)
     array([5, 1])
+    >>> resolve_idx(np.array([1, 3, 5]), -1, 6)
+    5
     >>> resolve_idx(
     ...     np.array([True, False, True, True]), np.array([False, True, True]), 4
     ... )
@@ -576,14 +580,17 @@ def resolve_idx(
     # so the result is always a plain index.
     if isinstance(old, IndexManager):
         old = old.get_for_array(new) if has_xp(new) else old.get_default()
-    if isinstance(new, int | np.integer | Sequence):
+    if not isinstance(new, slice):
         # convert using the namespace of `old` so array-API indices can be composed
         xp = old.__array_namespace__() if has_xp_base(old) else np
         new_arr = xp.asarray(new)
         if new_arr.size == 0:  # an empty sequence is an empty integer index
-            new_arr = xp.asarray(new, dtype=xp.int64)
+            new_arr = xp.asarray(new, dtype=xp.asarray(0).dtype)
         new = cast("SupportsArrayApiBase", new_arr)
-    return cast("_Index1DNorm | np.integer", _resolve_idx(old, new, length))
+    resolved = _resolve_idx(old, new, length)
+    if has_xp_base(resolved) and resolved.ndim == 0:  # scalar index
+        return int(resolved)  # type: ignore[call-overload]
+    return cast("_Index1DNorm", resolved)
 
 
 @_resolve_idx.register(SupportsArrayApiBase)

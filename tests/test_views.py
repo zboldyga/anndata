@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -1145,6 +1146,7 @@ def test_double_index_jax(*, to_bool: bool, mixed: bool) -> None:
 
 def test_public_view_api_exports() -> None:
     assert ad.experimental.DataFrameView is ad._core.views.DataFrameView
+    assert ad.experimental.DataFrameView.__module__ == "anndata.experimental"
     assert "DataFrameView" in ad.experimental.__all__
     assert ad.experimental.resolve_idx is ad._core.views.resolve_idx
     assert "resolve_idx" in ad.experimental.__all__
@@ -1229,13 +1231,13 @@ def test_resolve_idx(
 ) -> None:
     arr = np.arange(_RESOLVE_IDX_LENGTH)
     resolved = ad.experimental.resolve_idx(old, new, _RESOLVE_IDX_LENGTH)
-    assert isinstance(resolved, slice | np.ndarray | np.integer)
+    assert isinstance(resolved, slice | np.ndarray | int)
     np.testing.assert_array_equal(arr[resolved], arr[old][new])
 
     if isinstance(old, slice) and isinstance(new, slice):
         assert isinstance(resolved, slice)
     elif isinstance(new, int | np.integer):
-        assert isinstance(resolved, np.integer)
+        assert type(resolved) is int
     else:
         assert isinstance(resolved, np.ndarray)
         if (
@@ -1261,9 +1263,8 @@ def test_resolve_idx_matches_view_of_view(subset_func, subset_func2) -> None:
     # views wrap array indices in an `IndexManager`, which `resolve_idx` unwraps
     resolved = ad.experimental.resolve_idx(v1._oidx, oidx2, adata.n_obs)
     assert not isinstance(resolved, IndexManager)
-    assert isinstance(resolved, slice | np.ndarray | np.integer)
-    v3 = adata[int(resolved) if isinstance(resolved, np.integer) else resolved]
-    assert_equal(v3, v2)
+    assert isinstance(resolved, slice | np.ndarray | int)
+    assert_equal(adata[resolved], v2)
 
 
 @pytest.mark.parametrize("old", [slice(None), slice(0, 0), np.array([], dtype=int)])
@@ -1283,6 +1284,40 @@ def test_resolve_idx_array_api_bool_mask(new: slice | int | list) -> None:
     expected = np.arange(5)[mask][new]
     resolved = ad.experimental.resolve_idx(jnp.array(mask), new, 5)
     np.testing.assert_array_equal(np.arange(5)[np.asarray(resolved)], expected)
+
+
+@pytest.mark.array_api
+@pytest.mark.parametrize("old_mod", ["np", "jnp"])
+@pytest.mark.parametrize("new_mod", ["np", "jnp"])
+def test_resolve_idx_array_api_mixed(old_mod: str, new_mod: str) -> None:
+    assert jnp is not None
+    mods = dict(np=np, jnp=jnp)
+    old = mods[old_mod].asarray([1, 3, 5])
+    new = mods[new_mod].asarray([2, 0])
+    resolved = ad.experimental.resolve_idx(old, new, 6)
+    # the result uses the namespace of `old`
+    assert isinstance(resolved, type(old))
+    np.testing.assert_array_equal(np.asarray(resolved), [5, 1])
+    # scalar results are plain `int`s regardless of backend
+    assert ad.experimental.resolve_idx(old, mods[new_mod].asarray(1), 6) == 3
+    assert type(ad.experimental.resolve_idx(old, 1, 6)) is int
+
+
+@pytest.mark.array_api
+def test_resolve_idx_array_api_empty_without_x64() -> None:
+    assert jnp is not None
+    import jax
+
+    # the test plugin enables x64; with the default (x64 disabled) `int64` would warn
+    jax.config.update("jax_enable_x64", False)  # noqa: FBT003
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            resolved = ad.experimental.resolve_idx(jnp.asarray([1, 3, 5]), [], 6)
+    finally:
+        jax.config.update("jax_enable_x64", True)  # noqa: FBT003
+    assert np.asarray(resolved).shape == (0,)
+    assert np.issubdtype(np.asarray(resolved).dtype, np.integer)
 
 
 @pytest.mark.array_api
