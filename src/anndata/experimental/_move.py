@@ -14,7 +14,7 @@ from pandas.api.types import is_bool_dtype, is_complex_dtype, is_numeric_dtype
 from .._core.anndata import AnnData
 from .._core.merge import _resolve_axis, concat
 from .._warnings import warn
-from ..compat import AwkArray
+from ..compat import AwkArray, DaskArray
 from ..utils import asarray
 
 if TYPE_CHECKING:
@@ -262,6 +262,13 @@ def _values_from_mapping(
                 "supported sources are DataFrames, dense arrays and sparse matrices."
             )
             raise TypeError(msg)
+        if isinstance(elem, np.ma.MaskedArray):
+            # keep missingness: masked entries become NaN (upcasting if needed)
+            elem = (
+                np.ma.filled(elem.astype(np.float64), np.nan)
+                if np.ma.is_masked(elem)
+                else elem.data
+            )
         try:
             arr = asarray(elem)
         except Exception as e:
@@ -342,10 +349,11 @@ def _resolve_source(
         if missing := [k for k in names if k not in aligned_annot.columns]:
             msg = f"Columns {missing!r} not found in `{source}`."
             raise KeyError(msg)
-        values = aligned_annot[names]
-        if not values.columns.is_unique:
-            msg = f"Column labels of `{source}` are not unique: {names!r} is ambiguous."
+        if not aligned_annot.columns.is_unique:
+            dups = aligned_annot.columns[aligned_annot.columns.duplicated()].tolist()
+            msg = f"Column labels of `{source}` must be unique, but {dups!r} are duplicated."
             raise ValueError(msg)
+        values = aligned_annot[names]
         return (
             values,
             aligned_annot.drop(columns=names),
@@ -449,7 +457,7 @@ def move_to_x(
     grow_padding = {
         k: np.full((n_new, *v.shape[1:]), np.nan)
         for k, v in getattr(src, f"{grow_axis_name}m").items()
-        if isinstance(v, np.ndarray) and v.ndim > 2
+        if isinstance(v, np.ndarray | DaskArray) and v.ndim > 2
     }
     if aligned_axis == 0:
         new = AnnData(

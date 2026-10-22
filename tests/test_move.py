@@ -564,24 +564,37 @@ def test_move_to_x_validation_of_labels():
     with pytest.raises(ValueError, match="has no columns to move"):
         move_to_x(adata, "empty", source="obsm")
     adata.obs = pd.DataFrame(
-        np.ones((5, 2)), index=adata.obs_names, columns=["dup", "dup"]
+        np.ones((5, 3)), index=adata.obs_names, columns=["age", "dup", "dup"]
     )
-    with pytest.raises(ValueError, match="not unique: \\['dup'\\] is ambiguous"):
+    with pytest.raises(
+        ValueError, match="must be unique, but \\['dup'\\] are duplicated"
+    ):
         move_to_x(adata, "dup")
+    with pytest.raises(
+        ValueError, match="must be unique, but \\['dup'\\] are duplicated"
+    ):
+        move_to_x(adata, "age")  # unselected duplicates would break the result, too
+    adata.var = pd.DataFrame(
+        np.ones((3, 3)), index=adata.var_names, columns=["a", "dup", "dup"]
+    )
+    with pytest.raises(ValueError, match="`var` must be unique"):
+        move_to_x(adata, "a", source="var")
     adata.obs = pd.DataFrame({"c": np.ones(5, dtype=complex)}, index=adata.obs_names)
     with pytest.raises(ValueError, match="Only real numeric or boolean"):
         move_to_x(adata, "c")
 
 
 @pytest.mark.parametrize("source", ["obs", "var"])
-def test_move_to_x_keeps_nd_mappings(source):
+@pytest.mark.parametrize("as_dask", [False, True], ids=["numpy", "dask"])
+def test_move_to_x_keeps_nd_mappings(source, *, as_dask: bool):
     adata = gen_adata((5, 4), obsm_types=(), varm_types=())
-    adata.varm["tensor"] = np.arange(16).reshape(4, 2, 2)
-    adata.obsm["tensor"] = np.arange(20.0).reshape(5, 2, 2)
+    wrap = as_dense_dask_array if as_dask else np.asarray
+    adata.varm["tensor"] = wrap(np.arange(16).reshape(4, 2, 2))
+    adata.obsm["tensor"] = wrap(np.arange(20.0).reshape(5, 2, 2))
     res = move_to_x(adata, "float64", source=source)
     grown, kept = ("varm", "obsm") if source == "obs" else ("obsm", "varm")
-    grown_arr = getattr(res, grown)["tensor"]
-    kept_arr = getattr(res, kept)["tensor"]
+    grown_arr = asarray(getattr(res, grown)["tensor"])
+    kept_arr = asarray(getattr(res, kept)["tensor"])
     assert grown_arr.shape == (getattr(adata, grown)["tensor"].shape[0] + 1, 2, 2)
     np.testing.assert_array_equal(grown_arr[:-1], getattr(adata, grown)["tensor"])
     assert np.isnan(grown_arr[-1]).all()
@@ -594,3 +607,24 @@ def test_move_to_x_awkward_source_rejected():
     adata.obsm["awk"] = ak.Array(np.ones((5, 2)))
     with pytest.raises(TypeError, match="awkward array"):
         move_to_x(adata, "awk", source="obsm")
+
+
+@pytest.mark.parametrize("source", ["obsm", "varm"])
+@pytest.mark.parametrize("dtype", [float, int], ids=["float", "int"])
+def test_move_to_x_masked_source(source, dtype):
+    adata = gen_adata((3, 2), obsm_types=(), varm_types=())
+    n = adata.n_obs if source == "obsm" else adata.n_vars
+    masked = np.ma.array(
+        np.full((n, 1), 999, dtype=dtype),
+        mask=np.array([[True], *([[False]] * (n - 1))]),
+    )
+    getattr(adata, source)["m"] = masked
+    res = move_to_x(adata, "m", source=source)
+    moved = asarray(res.X)[:, -1] if source == "obsm" else asarray(res.X)[-1]
+    assert np.isnan(moved[0])
+    np.testing.assert_array_equal(moved[1:], 999)
+    # an unmasked masked array keeps its dtype
+    getattr(adata, source)["u"] = np.ma.array(np.ones((n, 1), dtype=dtype))
+    res_u = move_to_x(adata, "u", source=source)
+    moved_u = asarray(res_u.X)[:, -1] if source == "obsm" else asarray(res_u.X)[-1]
+    np.testing.assert_array_equal(moved_u, 1)
