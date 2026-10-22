@@ -1897,3 +1897,210 @@ def concat(  # noqa: PLR0912, PLR0913, PLR0915
         "uns": uns,
         "raw": raw,
     })
+
+
+#####################
+# Merging whole objects
+#####################
+
+
+def _check_unique_index(idx: pd.Index, axis_name: str, pos: int) -> None:
+    if not idx.is_unique:
+        msg = (
+            f"Cannot merge: `{axis_name}_names` of the AnnData object at position "
+            f"{pos} are not unique. Call `.{axis_name}_names_make_unique()` first."
+        )
+        raise ValueError(msg)
+
+
+def _merge_raw(
+    adatas: Collection[AnnData], obs_reindexers: Sequence[Reindexer]
+) -> Mapping[str, Any] | None:
+    """Pick the :attr:`~anndata.AnnData.raw` for :func:`merge`, if there is exactly one.
+
+    Returned as the mapping accepted by the :class:`~anndata.AnnData` constructor.
+    """
+    with_raw = [
+        (a.raw, r)
+        for a, r in zip(adatas, obs_reindexers, strict=True)
+        if a.raw is not None
+    ]
+    if len(with_raw) == 0:
+        return None
+    if len(with_raw) > 1:
+        msg = (
+            "More than one AnnData object has a `.raw` attribute, "
+            "not merging `.raw` attributes."
+        )
+        warn(msg, UserWarning)
+        return None
+    (raw, reindexer), *_ = with_raw
+    return {"X": reindexer(raw.X, axis=0), "var": raw.var, "varm": dict(raw.varm)}
+
+
+def merge(
+    adatas: Collection[AnnData],
+    *,
+    join: Join_T = "inner",
+    merge: StrategiesLiteral | Callable[[Collection[Mapping]], Mapping] = "unique",
+    uns_merge: StrategiesLiteral
+    | Callable[[Collection[Mapping]], Mapping]
+    | None = "unique",
+    fill_value: Scalar | None = None,
+) -> AnnData:
+    """Merges the elements of AnnData objects sharing the same observations and variables.
+
+    Where :func:`~anndata.concat` stacks objects along an axis, `merge` combines
+    objects that describe the *same* observations and variables but hold different
+    elements, e.g. one object with `layers` and another with `obsm`/`varm`/`uns`
+    produced by an analysis. This is the AnnData analogue of :func:`xarray.merge`.
+
+    Params
+    ------
+    adatas
+        The objects to be merged.
+    join
+        How to align the observations and variables of the inputs. If `"inner"`, the
+        intersection of `obs_names` (and of `var_names`) is used; if `"outer"`, the
+        union. Elements are reindexed accordingly, in the same way as the
+        non-concatenation axis of :func:`~anndata.concat`. Objects with identical
+        names are passed through without reindexing.
+    merge
+        How elements present in more than one object are resolved. Applied to
+        `X` (stored in `layers` under the key `None`), `layers`, `obsm`, `varm`,
+        `obsp`, `varp`, and to the columns of `obs` and `var`:
+
+        * `"same"`: Elements that are the same in each of the objects.
+        * `"unique"`: Elements for which there is only one possible value.
+        * `"first"`: The first element seen at each from each position.
+        * `"only"`: Elements that show up in only one of the objects.
+
+        Note that with `"same"` and `"unique"`, an element that differs between
+        objects is dropped from the result rather than raising an error.
+    uns_merge
+        How the elements of `.uns` are selected. Uses the same set of strategies as
+        the `merge` argument, except applied recursively. `None` drops `.uns`.
+    fill_value
+        When `join="outer"`, this is the value that will be used to fill the introduced
+        indices. By default, sparse arrays are padded with zeros, while dense arrays and
+        DataFrames are padded with missing values.
+
+    Notes
+    -----
+    Like the :class:`~anndata.AnnData` constructor, `merge` does not copy elements
+    that need no reindexing, so the result may share memory with its inputs.
+    Call :meth:`~anndata.AnnData.copy` on the result if you need independent data.
+
+    :attr:`~anndata.AnnData.raw` is kept only when exactly one object has it;
+    otherwise a warning is emitted and the result has no `.raw`.
+
+    Examples
+    --------
+
+    >>> import anndata as ad, pandas as pd, numpy as np
+    >>> expr = ad.AnnData(
+    ...     X=np.arange(6, dtype=np.float32).reshape(3, 2),
+    ...     obs=pd.DataFrame({"group": ["a", "b", "b"]}, index=["s1", "s2", "s3"]),
+    ...     var=pd.DataFrame(index=["var1", "var2"]),
+    ...     layers={"counts": np.ones((3, 2))},
+    ... )
+    >>> pca = ad.AnnData(
+    ...     obs=pd.DataFrame(index=["s1", "s2", "s3"]),
+    ...     var=pd.DataFrame(index=["var1", "var2"]),
+    ...     obsm={"X_pca": np.zeros((3, 2))},
+    ...     varm={"PCs": np.zeros((2, 2))},
+    ...     uns={"pca": {"variance": [0.5, 0.5]}},
+    ... )
+    >>> ad.merge([expr, pca])
+    AnnData object with n_obs × n_vars = 3 × 2
+        obs: 'group'
+        uns: 'pca'
+        obsm: 'X_pca'
+        varm: 'PCs'
+        layers: 'counts', None (.X)
+
+    Objects are aligned on their names; with `join="inner"` only shared
+    observations and variables are kept, in the order of the first object:
+
+    >>> other = ad.AnnData(
+    ...     obs=pd.DataFrame({"score": [1.0, 2.0]}, index=["s3", "s1"]),
+    ...     var=pd.DataFrame(index=["var2", "var1"]),
+    ... )
+    >>> merged = ad.merge([expr, other])
+    >>> merged.obs
+       group  score
+    s1     a    2.0
+    s3     b    1.0
+    >>> merged.to_df()
+        var1  var2
+    s1   0.0   1.0
+    s3   4.0   5.0
+
+    Conflicting elements follow the `merge` strategy:
+
+    >>> a = ad.AnnData(obs=expr.obs, var=expr.var, obsm={"X_umap": np.ones((3, 2))})
+    >>> b = ad.AnnData(obs=expr.obs, var=expr.var, obsm={"X_umap": np.zeros((3, 2))})
+    >>> ad.merge([a, b]).obsm.keys()
+    KeysView(AxisArrays with keys: )
+    >>> float(ad.merge([a, b], merge="first").obsm["X_umap"].sum())
+    6.0
+    """
+    adatas = list(adatas)
+    if len(adatas) == 0:
+        msg = "No objects to merge."
+        raise ValueError(msg)
+    if merge is None:
+        msg = "`merge=None` would drop every element; pass a merge strategy."
+        raise ValueError(msg)
+    merge = resolve_merge_strategy(merge)
+    uns_merge = resolve_merge_strategy(uns_merge)
+
+    for pos, a in enumerate(adatas):
+        _check_unique_index(a.obs_names, "obs", pos)
+        _check_unique_index(a.var_names, "var", pos)
+
+    obs_names = merge_indices([a.obs_names for a in adatas], join=join)
+    var_names = merge_indices([a.var_names for a in adatas], join=join)
+    obs_reindexers = [gen_reindexer(obs_names, a.obs_names) for a in adatas]
+    var_reindexers = [gen_reindexer(var_names, a.var_names) for a in adatas]
+
+    def merge_mapping(
+        attr: str, *, axes: Collection[tuple[Literal["obs", "var"], Literal[0, 1]]]
+    ) -> Mapping:
+        """Reindex each element of `attr` along `axes` and resolve conflicts with `merge`.
+
+        `axes` lists which axis of the AnnData object (`"obs"` or `"var"`) each
+        aligned axis of the element corresponds to.
+        """
+
+        def reindex(el, obs_r: Reindexer, var_r: Reindexer):
+            for axis_name, el_axis in axes:
+                r = obs_r if axis_name == "obs" else var_r
+                el = r(el, axis=el_axis, fill_value=fill_value)
+            return el
+
+        return merge([
+            {k: reindex(v, obs_r, var_r) for k, v in getattr(a, attr).items()}
+            for a, obs_r, var_r in zip(
+                adatas, obs_reindexers, var_reindexers, strict=True
+            )
+        ])
+
+    obs = merge_dataframes(
+        [to_memory(a.obs) for a in adatas], obs_names, merge_strategy=merge
+    )
+    var = merge_dataframes(
+        [to_memory(a.var) for a in adatas], var_names, merge_strategy=merge
+    )
+
+    return AnnData(
+        obs=obs,
+        var=var,
+        layers=merge_mapping("layers", axes=[("obs", 0), ("var", 1)]),
+        obsm=merge_mapping("obsm", axes=[("obs", 0)]),
+        varm=merge_mapping("varm", axes=[("var", 0)]),
+        obsp=merge_mapping("obsp", axes=[("obs", 0), ("obs", 1)]),
+        varp=merge_mapping("varp", axes=[("var", 0), ("var", 1)]),
+        uns=uns_merge([a.uns for a in adatas]),
+        raw=_merge_raw(adatas, obs_reindexers),
+    )

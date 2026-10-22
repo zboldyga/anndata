@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ._core.anndata import AnnData
 from ._core.extensions import register_anndata_namespace
-from ._core.merge import concat
+from ._core.merge import concat, merge
 from ._core.raw import Raw
 from ._settings import settings
 from ._warnings import (
@@ -34,6 +34,7 @@ __all__ = [
     "concat",
     "experimental",
     "io",
+    "merge",
     "read_h5ad",
     "read_zarr",
     "register_anndata_namespace",

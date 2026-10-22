@@ -35,6 +35,7 @@ See also the section on concatenation.
    :toctree: generated/
 
    concat
+   merge
 ```
 
 (reading-api)=
