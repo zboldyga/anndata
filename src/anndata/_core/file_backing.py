@@ -184,6 +184,11 @@ def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray:
     blocks = np.empty(grid.shape, dtype=object)
     for i, block in enumerate(dask.compute(*grid.ravel())):
         blocks.flat[i] = block
+    if not all(sparse.issparse(block) for block in blocks.flat):
+        # `_meta` was wrong about the chunks; behave like `.compute()` would
+        from dask.array.core import concatenate3
+
+        return concatenate3(blocks.tolist())
     n_block_rows, n_block_cols = blocks.shape
     if n_block_cols == 1:
         rows = list(blocks[:, 0])

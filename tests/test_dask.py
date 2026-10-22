@@ -461,6 +461,24 @@ def test_to_memory_sparse_dask_blockwise(
     assert_equal(result, x.compute())
 
 
+def test_to_memory_sparse_meta_dense_chunks() -> None:
+    """A wrong sparse `_meta` on dense chunks still behaves like `.compute()`."""
+    import dask.array as da
+
+    from anndata._core.file_backing import to_memory
+
+    arr = np.arange(60, dtype=np.float32).reshape(12, 5)
+    x = da.from_array(arr, chunks=(4, 3)).map_blocks(
+        np.asarray, meta=sparse.csr_matrix((0, 0), dtype=np.float32)
+    )
+    assert isinstance(x._meta, CSMatrix)
+
+    result = to_memory(x)
+
+    assert isinstance(result, np.ndarray)
+    np.testing.assert_array_equal(result, arr)
+
+
 def test_to_memory_sparse_dask_single_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     """Blockwise materialization computes all chunks in one scheduler pass
     and bypasses dask’s own concatenation (which copies sparse chunks twice)."""
