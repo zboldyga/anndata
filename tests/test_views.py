@@ -1238,10 +1238,9 @@ def test_resolve_idx_matches_view_of_view(subset_func, subset_func2) -> None:
     v2 = v1[oidx2]
     # `v1._oidx` is the normalized index stored by the view
     assert v1._oidx is not None
+    # views wrap array indices in an `IndexManager`, which `resolve_idx` unwraps
     resolved = ad.experimental.resolve_idx(v1._oidx, oidx2, adata.n_obs)
-    # views wrap array indices in an `IndexManager`, which is passed through
-    if isinstance(resolved, IndexManager):
-        resolved = np.asarray(resolved.get_default())
+    assert not isinstance(resolved, IndexManager)
     assert isinstance(resolved, slice | np.ndarray | np.integer)
     v3 = adata[int(resolved) if isinstance(resolved, np.integer) else resolved]
     assert_equal(v3, v2)

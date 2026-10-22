@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from functools import reduce, singledispatch
 from importlib.util import find_spec
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -519,10 +519,10 @@ def _resolve_idx(
 
 
 def resolve_idx(
-    old: _Index1DNorm[IndexManager],
-    new: _Index1DNorm[IndexManager] | int | np.integer | Sequence[int] | Sequence[bool],
+    old: _Index1DNorm,
+    new: _Index1DNorm | int | np.integer | Sequence[int] | Sequence[bool],
     length: int,
-) -> _Index1DNorm[IndexManager] | np.integer:
+) -> _Index1DNorm | np.integer:
     """Compose two consecutive 1D indices into one index relative to the original axis.
 
     When a view of a view is created, the indices of both subsetting operations
@@ -571,7 +571,11 @@ def resolve_idx(
     """
     if isinstance(new, int | np.integer | Sequence):
         new = np.asarray(new)
-    return _resolve_idx(old, new, length)
+    # views store array indices wrapped in an `IndexManager`; unwrap it here
+    # so the result is always a plain index.
+    if isinstance(old, IndexManager):
+        old = old.get_for_array(new) if has_xp(new) else old.get_default()
+    return cast("_Index1DNorm | np.integer", _resolve_idx(old, new, length))
 
 
 @_resolve_idx.register(SupportsArrayApiBase)

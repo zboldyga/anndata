@@ -222,7 +222,7 @@ Building blocks for subclassing {class}`AnnData`, e.g. to add further aligned at
 ```{eval-rst}
 .. autosummary::
    :toctree: generated/
-   :template: class-minimal
+   :template: class-own-members
 
    experimental.DataFrameView
 
