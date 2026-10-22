@@ -94,8 +94,9 @@ def test_inputs_not_modified(expr: AnnData, pca: AnnData):
 def test_reindexed_elements_are_copies(expr: AnnData, pca: AnnData):
     merged = ad.merge([expr, pca[["s3", "s2", "s1"]]])
     x_pca = merged.obsm["X_pca"]
-    assert isinstance(x_pca, np.ndarray)
+    assert type(x_pca) is np.ndarray
     x_pca[0, 0] = 100
+    assert x_pca[0, 0] == 100
     merged.obs["group"] = "z"
     assert pca.obsm["X_pca"][2, 0] != 100
     assert expr.obs["group"].iloc[0] == "a"
@@ -314,9 +315,9 @@ def test_backed_input_is_loaded(expr: AnnData, pca: AnnData, tmp_path):
     assert backed.isbacked
     merged = ad.merge([backed, pca])
     assert not merged.isbacked
-    assert isinstance(merged.X, np.ndarray)
+    assert type(merged.X) is np.ndarray
     assert merged.raw is not None
-    assert isinstance(merged.raw.X, np.ndarray)
+    assert type(merged.raw.X) is np.ndarray
     assert_equal(merged.X, expr.X)
     reordered = ad.merge([backed, pca[["s2", "s1"]]])
     assert_equal(reordered.X, expr[["s1", "s2"]].X)
@@ -332,3 +333,89 @@ def test_dask_elements(expr: AnnData):
     reordered = ad.merge([lazy, expr[["s3", "s1"]]])
     assert isinstance(reordered.layers["lazy"], da.Array)
     assert reordered.layers["lazy"].shape == (2, 2)
+
+
+@pytest.mark.parametrize("idx", [slice(0, 1), ["b", "a"]], ids=["slice", "reorder"])
+def test_view_inputs_do_not_write_through(idx):
+    a = AnnData(
+        X=np.zeros((2, 2)),
+        obs=pd.DataFrame(index=["a", "b"]),
+        var=pd.DataFrame(index=["x", "y"]),
+        obsm={"m": np.zeros((2, 1))},
+    )
+    view = a[idx]
+    merged = ad.merge([view, _empty(view.obs_names, view.var_names)])
+    assert type(merged.X) is np.ndarray
+    assert type(merged.obsm["m"]) is np.ndarray
+    merged.X[0, 0] = 99
+    merged.obsm["m"][0, 0] = 99
+    assert merged.X[0, 0] == 99
+    assert merged.obsm["m"][0, 0] == 99
+    assert a.X[0, 0] == 0
+    assert a.obsm["m"][0, 0] == 0
+
+
+def test_outer_join_awkward():
+    ak = pytest.importorskip("awkward")
+    var = pd.DataFrame(index=["x"])
+    a = _empty(["a", "b"], var.index, obsm={"awk": ak.Array([[1], [2, 3]])})
+    b = _empty(["c"], var.index)
+    merged = ad.merge([a, b], join="outer")
+    assert merged.obsm["awk"].to_list() == [[1], [2, 3], None]
+    reordered = ad.merge([b, a], join="outer")
+    assert list(reordered.obs_names) == ["a", "b", "c"]
+    assert reordered.obsm["awk"].to_list() == [[1], [2, 3], None]
+
+
+@pytest.mark.parametrize("strategy", ["unique", "same"])
+def test_equal_dense_and_sparse_x_is_order_independent(strategy):
+    axes = (["a", "b"], ["x", "y"])
+    dense = _empty(*axes, X=np.ones((2, 2)))
+    sp = _empty(*axes, X=sparse.csr_matrix(np.ones((2, 2))))
+    assert ad.merge([dense, sp], merge=strategy).X is not None
+    assert ad.merge([sp, dense], merge=strategy).X is not None
+    other = _empty(*axes, X=np.zeros((2, 2)))
+    assert ad.merge([sp, other], merge=strategy).X is None
+    assert ad.merge([other, sp], merge=strategy).X is None
+
+
+def test_raw_without_x():
+    a = AnnData(
+        obs=pd.DataFrame(index=["a"]), var=pd.DataFrame({"c": [1]}, index=["x"])
+    )
+    a.raw = a.copy()
+    merged = ad.merge([a])
+    assert merged.raw is not None
+    assert merged.raw.X is None
+
+
+def test_outer_join_dask_integer():
+    da = pytest.importorskip("dask.array")
+    var = pd.DataFrame(index=["x", "y"])
+    a = _empty(["a"], var.index, X=da.ones((1, 2), dtype=int))
+    b = _empty(["b"], var.index)
+    merged = ad.merge([a, b], join="outer")
+    assert isinstance(merged.X, da.Array)
+    assert_equal(merged.X.compute(), np.array([[1.0, 1.0], [np.nan, np.nan]]))
+    filled = ad.merge([a, b], join="outer", fill_value=-1)
+    assert_equal(filled.X.compute(), np.array([[1, 1], [-1, -1]]))
+
+
+def test_outer_join_fill_value_scope():
+    var = pd.DataFrame(index=["x", "y"])
+    a = AnnData(X=np.ones((1, 2)), obs=pd.DataFrame({"c": [1.0]}, index=["a"]), var=var)
+    a.raw = a
+    b = _empty(["b"], var.index)
+    merged = ad.merge([a, b], join="outer", fill_value=-7)
+    assert merged.raw is not None
+    assert_equal(merged.raw.X, np.array([[1.0, 1.0], [-7.0, -7.0]]))
+    # obs/var columns are always padded with missing values
+    assert merged.obs["c"].isna().tolist() == [False, True]
+
+
+def test_outer_join_index_order_follows_pandas_union():
+    var = pd.DataFrame(index=["x"])
+    a = _empty(["z", "b"], var.index)
+    b = _empty(["a"], var.index)
+    assert list(ad.merge([a, b], join="outer").obs_names) == ["a", "b", "z"]
+    assert list(ad.merge([a, b]).obs_names) == []

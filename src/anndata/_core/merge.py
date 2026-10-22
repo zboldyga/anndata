@@ -210,6 +210,9 @@ def equal_sparse(a, b) -> bool:
             )
         )
         # fmt: on
+    elif isinstance(b, np.ndarray):
+        # Dense vs. sparse: compare values so the result does not depend on argument order
+        return equal(b, a)
     else:
         return False
 
@@ -642,6 +645,12 @@ class Reindexer:
         sub_el = _subset(el, make_slice(indexer, axis, len(shape)))
 
         if is_outer:
+            # Promote e.g. integer arrays so that a `nan` fill value can be stored
+            if (
+                np.isscalar(fill_value)
+                and (dtype := np.result_type(sub_el.dtype, fill_value)) != sub_el.dtype
+            ):
+                sub_el = sub_el.astype(dtype)
             # TODO: Remove this condition once https://github.com/dask/dask/pull/12078 is released
             if is_sparse_sub and np.isscalar(fill_value):
                 fill_value = np.array([[fill_value]])
@@ -804,9 +813,10 @@ class Reindexer:
                 msg = "This should be unreachable, please open an issue."
                 raise Exception(msg)
         else:
-            if len(self.new_idx) > len(self.old_idx):
-                el = ak.pad_none(el, 1, axis=axis)  # axis == 0
-            return el[self.idx]
+            idx = self.idx
+            if (idx == -1).any():  # outer join: index -1 must map to a missing row
+                el = ak.pad_none(el, len(el) + 1, axis=axis)  # axis == 0
+            return el[idx]
 
     @property
     def idx(self) -> NDArray[np.intp]:
@@ -1915,7 +1925,10 @@ def _check_unique_index(idx: pd.Index, axis_name: str, pos: int) -> None:
 
 
 def _merge_raw(
-    adatas: Collection[AnnData], obs_reindexers: Sequence[Reindexer]
+    adatas: Collection[AnnData],
+    obs_reindexers: Sequence[Reindexer],
+    *,
+    fill_value: Scalar | None = None,
 ) -> Mapping[str, Any] | None:
     """Pick the :attr:`~anndata.AnnData.raw` for :func:`merge`, if there is exactly one.
 
@@ -1936,11 +1949,10 @@ def _merge_raw(
         warn(msg, UserWarning)
         return None
     (raw, reindexer), *_ = with_raw
-    return {
-        "X": reindexer(_load_if_backed(raw.X), axis=0),
-        "var": raw.var,
-        "varm": dict(raw.varm),
-    }
+    raw_x = _load_if_backed(raw.X)
+    if raw_x is not None:
+        raw_x = reindexer(raw_x, axis=0, fill_value=fill_value)
+    return {"X": raw_x, "var": raw.var, "varm": dict(raw.varm)}
 
 
 def _load_if_backed(el):
@@ -1971,10 +1983,11 @@ def merge(
         The objects to be merged.
     join
         How to align the observations and variables of the inputs. If `"inner"`, the
-        intersection of `obs_names` (and of `var_names`) is used; if `"outer"`, the
-        union. Elements are reindexed accordingly, in the same way as the
-        non-concatenation axis of :func:`~anndata.concat`. Objects with identical
-        names are passed through without reindexing.
+        intersection of `obs_names` (and of `var_names`) is used, in the order of the
+        first object; if `"outer"`, their union (sorted when possible, as for
+        :meth:`pandas.Index.union`). Elements are reindexed accordingly, in the same
+        way as the non-concatenation axis of :func:`~anndata.concat`. Objects whose
+        names already match are passed through without reindexing.
     merge
         How elements present in more than one object are resolved. Applied to
         `X` (stored in `layers` under the key `None`), `layers`, `obsm`, `varm`,
@@ -1992,15 +2005,18 @@ def merge(
         the `merge` argument, except applied recursively. `None` drops `.uns`.
     fill_value
         When `join="outer"`, this is the value that will be used to fill the introduced
-        indices. By default, sparse arrays are padded with zeros, while dense arrays and
-        DataFrames are padded with missing values.
+        indices of `X`, `layers`, `obsm`, `varm`, `obsp`, `varp` and `raw.X`.
+        By default, sparse arrays are padded with zeros, while dense arrays and
+        DataFrames are padded with missing values. Columns of `obs` and `var` are
+        always padded with missing values.
 
     Notes
     -----
     Like the :class:`~anndata.AnnData` constructor, `merge` does not copy elements
     that need no reindexing, so the result may share memory with its inputs.
     Call :meth:`~anndata.AnnData.copy` on the result if you need independent data.
-    The result is always in memory: backed `X` and `raw.X` are loaded.
+    Views are copied, and the result is always in memory: backed `X` and `raw.X`
+    are loaded.
 
     :attr:`~anndata.AnnData.raw` is kept only when exactly one object has it;
     otherwise a warning is emitted and the result has no `.raw`.
@@ -2056,7 +2072,8 @@ def merge(
     >>> float(ad.merge([a, b], merge="first").obsm["X_umap"].sum())
     6.0
     """
-    adatas = list(adatas)
+    # Views are materialized so no element of the result writes through to a parent
+    adatas = [a.to_memory(copy=True) if a.is_view else a for a in adatas]
     if len(adatas) == 0:
         msg = "No objects to merge."
         raise ValueError(msg)
@@ -2114,5 +2131,5 @@ def merge(
         obsp=merge_mapping("obsp", axes=[("obs", 0), ("obs", 1)]),
         varp=merge_mapping("varp", axes=[("var", 0), ("var", 1)]),
         uns=uns_merge([a.uns for a in adatas]),
-        raw=_merge_raw(adatas, obs_reindexers),
+        raw=_merge_raw(adatas, obs_reindexers, fill_value=fill_value),
     )
