@@ -12,6 +12,10 @@ so :func:`lazy_type` creates a placeholder class that stands in for the real one
   and forwards to the real class (e.g. `XDataset.from_dataframe(...)`).
 - :func:`functools.singledispatch` treats the placeholder like a registered
   abstract base class, so `@f.register(DaskArray)` keeps working.
+  Caveat: `singledispatch` ranks such virtual bases below *explicit* base classes of the
+  real class (e.g. `Mapping` for `xarray.Dataset`) and cannot order two unrelated virtual
+  bases (e.g. a placeholder and a runtime protocol). If a function registers both, handle
+  the placeholder explicitly in the other implementation (see `_gen_dataframe`).
 
 Placeholders cannot be subclassed; use `factory=` to lazily build a real subclass instead.
 """
