@@ -302,10 +302,13 @@ class DataFrameView(_ViewMixin, pd.DataFrame):
 
     Instances are returned by e.g. :attr:`AnnData.obs <anndata.AnnData.obs>`
     when the :class:`~anndata.AnnData` object is a view.
-    Modifying one (e.g. via ``__setitem__``, :meth:`drop` with ``inplace=True``,
-    or assigning its ``index``) emits an :class:`~anndata.ImplicitModificationWarning`
-    and turns the parent view into an actual :class:`~anndata.AnnData`
-    before applying the modification to the parent’s attribute.
+    Setting an item (``df[key] = ...``) or assigning the ``index``
+    emits an :class:`~anndata.ImplicitModificationWarning`,
+    turns the parent view into an actual :class:`~anndata.AnnData`,
+    and applies the modification to the parent’s attribute;
+    :meth:`drop` with ``inplace=True`` does the same without a warning.
+    Other in-place modifications (e.g. via :attr:`~pandas.DataFrame.loc`)
+    are not intercepted.
 
     This class is useful when subclassing :class:`~anndata.AnnData`
     with additional aligned data frames.
@@ -318,8 +321,8 @@ class DataFrameView(_ViewMixin, pd.DataFrame):
         Reference to the parent view’s element this data frame is a view of:
         ``(parent, attr_name)`` or ``(parent, attr_name, keys)``,
         e.g. ``(adata_view, "obs")``.
-        `None` creates a data frame without a parent that behaves like a plain
-        :class:`pandas.DataFrame`.
+        `None` creates a data frame without a parent;
+        setting items then modifies it in place without a warning.
     **kwargs
         Keyword arguments passed to :class:`pandas.DataFrame`.
     """
@@ -569,12 +572,17 @@ def resolve_idx(
     ... )
     array([False, False,  True,  True])
     """
-    if isinstance(new, int | np.integer | Sequence):
-        new = np.asarray(new)
     # views store array indices wrapped in an `IndexManager`; unwrap it here
     # so the result is always a plain index.
     if isinstance(old, IndexManager):
         old = old.get_for_array(new) if has_xp(new) else old.get_default()
+    if isinstance(new, int | np.integer | Sequence):
+        # convert using the namespace of `old` so array-API indices can be composed
+        xp = old.__array_namespace__() if has_xp_base(old) else np
+        new_arr = xp.asarray(new)
+        if new_arr.size == 0:  # an empty sequence is an empty integer index
+            new_arr = xp.asarray(new, dtype=xp.int64)
+        new = cast("SupportsArrayApiBase", new_arr)
     return cast("_Index1DNorm | np.integer", _resolve_idx(old, new, length))
 
 
@@ -586,7 +594,12 @@ def _resolve_idx_array_api(
 
     # handle slice indexing by converting to array indices
     if isinstance(new, slice):
-        new = xp.arange(*new.indices(old.shape[0]))
+        n_selected = (
+            xp.nonzero(old)[0].shape[0]
+            if xp.isdtype(old.dtype, "bool")
+            else old.shape[0]
+        )
+        new = xp.arange(*new.indices(n_selected))
     if not has_xp_base(new):  # pragma: no cover
         msg = "New indexer must have array api compatibility"
         raise RuntimeError(msg)

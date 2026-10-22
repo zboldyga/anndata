@@ -1164,10 +1164,25 @@ def test_public_dataframe_view() -> None:
     assert custom._view_args is not None
     assert custom._view_args.parent is view
     assert custom._view_args.attrname == "obs"
-    # With `view_args=None`, it behaves like a plain DataFrame
+    # Setting an item actualizes the parent view
+    assert view.is_view
+    with pytest.warns(ImplicitModificationWarning, match=r"attribute `.obs` of view"):
+        custom["b"] = 0
+    assert not view.is_view
+    assert "b" in view.obs.columns
+    assert "b" not in adata.obs.columns
+
+    # Three-element `view_args` form referencing a nested element
+    view = adata[:3]
+    nested = ad.experimental.DataFrameView(df, view_args=(view, "uns", ("foo",)))
+    assert nested._view_args is not None
+    assert nested._view_args.keys == ("foo",)
+
+    # With `view_args=None`, no parent is modified
     plain = ad.experimental.DataFrameView(df, view_args=None)
     plain["b"] = 0  # no ImplicitModificationWarning (strict warnings would fail)
     assert plain._view_args is None
+    assert view.is_view
 
 
 _RESOLVE_IDX_LENGTH = 10
@@ -1199,6 +1214,11 @@ _RESOLVE_IDX_NEW = {
     "int_list": [3, 1],
     "bool_array": np.array([True, False, False, True, True, False, True]),
     "bool_list": [False, True, True, False, False, True, True],
+    "neg_int": -2,
+    "repeated": [1, 1, 6, 1],
+    "empty_list": [],
+    "empty_int_array": np.array([], dtype=int),
+    "empty_bool_array": np.zeros(7, dtype=bool),
 }
 
 
@@ -1244,6 +1264,34 @@ def test_resolve_idx_matches_view_of_view(subset_func, subset_func2) -> None:
     assert isinstance(resolved, slice | np.ndarray | np.integer)
     v3 = adata[int(resolved) if isinstance(resolved, np.integer) else resolved]
     assert_equal(v3, v2)
+
+
+@pytest.mark.parametrize("old", [slice(None), slice(0, 0), np.array([], dtype=int)])
+@pytest.mark.parametrize("new", [slice(None), [], np.array([], dtype=bool)])
+def test_resolve_idx_empty_axis(old: slice | np.ndarray, new: slice | list) -> None:
+    arr = np.arange(0)
+    resolved = ad.experimental.resolve_idx(old, new, 0)
+    assert isinstance(resolved, slice | np.ndarray)
+    assert arr[resolved].shape == (0,)
+
+
+@pytest.mark.array_api
+@pytest.mark.parametrize("new", [slice(None), slice(1, None), 1, [2, 0], []])
+def test_resolve_idx_array_api_bool_mask(new: slice | int | list) -> None:
+    assert jnp is not None
+    mask = np.array([True, False, True, False, True])
+    expected = np.arange(5)[mask][new]
+    resolved = ad.experimental.resolve_idx(jnp.array(mask), new, 5)
+    np.testing.assert_array_equal(np.arange(5)[np.asarray(resolved)], expected)
+
+
+@pytest.mark.array_api
+def test_view_of_view_array_api_bool_mask_then_slice() -> None:
+    assert jnp is not None
+    adata = gen_adata((5, 4), X_type=jnp.array)
+    mask = jnp.array([True, False, True, False, True])
+    assert_equal(adata[mask][:], adata[mask])
+    assert_equal(adata[mask][1:], adata[mask][[1, 2]])
 
 
 def test_resolve_idx_unsupported_old() -> None:
