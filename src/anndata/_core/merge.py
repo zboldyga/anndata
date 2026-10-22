@@ -215,7 +215,7 @@ def equal_sparse(a, b) -> bool:
 
 @equal.register(AwkArray)
 def equal_awkward(a, b) -> bool:
-    from ..compat import awkward as ak
+    import awkward as ak
 
     return ak.almost_equal(a, b)
 
@@ -901,7 +901,7 @@ def concat_arrays(  # noqa: PLR0911, PLR0912
         df.index = index
         return df
     elif any(isinstance(a, AwkArray) for a in arrays):
-        from ..compat import awkward as ak
+        import awkward as ak
 
         if not all(
             isinstance(a, AwkArray) or a is MissingVal or 0 in a.shape for a in arrays

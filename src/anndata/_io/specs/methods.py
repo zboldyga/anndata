@@ -1058,12 +1058,12 @@ def read_sparse_partial(elem, *, items=None, indices=(slice(None), slice(None)))
 def write_awkward(
     f: _GroupStorageType,
     k: str,
-    v: views.AwkwardArrayView | AwkArray,
+    v: AwkArray,
     *,
     _writer: Writer,
     dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ):
-    from anndata.compat import awkward as ak
+    import awkward as ak
 
     group = f.require_group(k)
     del k
@@ -1080,7 +1080,7 @@ def write_awkward(
 @_REGISTRY.register_read(h5py.Group, IOSpec("awkward-array", "0.1.0"))
 @_REGISTRY.register_read(zarr.Group, IOSpec("awkward-array", "0.1.0"))
 def read_awkward(elem: _GroupStorageType, *, _reader: Reader) -> AwkArray:
-    from anndata.compat import awkward as ak
+    import awkward as ak
 
     attrs: Mapping[str, Any] = elem.attrs
     form = _read_attr(attrs, "form")

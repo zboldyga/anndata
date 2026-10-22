@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 
+import awkward as ak
 import numpy as np
 import numpy.testing as npt
 import pandas as pd
@@ -13,7 +14,6 @@ from awkward.operations import str as ak_str
 import anndata
 from anndata import AnnData, ImplicitModificationWarning, read_h5ad
 from anndata.compat import AwkArray
-from anndata.compat import awkward as ak
 from anndata.tests.helpers import assert_equal, gen_adata, gen_awkward
 from anndata.utils import axis_len
 

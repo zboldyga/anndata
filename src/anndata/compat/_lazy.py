@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from types import NotImplementedType
+    from types import ModuleType, NotImplementedType
 
 __all__ = ["LazyType", "lazy_type", "lazy_type_for"]
 
@@ -60,6 +60,7 @@ class LazyType(ABCMeta):
         """
         if (real := cls._lazy_real) is not None:
             return real
+        mod: ModuleType | None
         if import_:
             try:
                 mod = import_module(cls._lazy_module)
@@ -97,7 +98,8 @@ class LazyType(ABCMeta):
         return f"<lazy class '{cls.__module__}.{cls.__qualname__}'>"
 
 
-def _lazy_subclasshook(cls: LazyType, sub: type) -> bool | NotImplementedType:
+def _lazy_subclasshook(cls: type, sub: type, /) -> bool | NotImplementedType:
+    assert isinstance(cls, LazyType)
     if isinstance(sub, LazyType):  # both symbolic: resolve them for real
         real = cls._lazy_get(import_=True)
         sub_real = sub._lazy_get(import_=True)

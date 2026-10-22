@@ -44,7 +44,7 @@ def test_placeholder_without_import():
     assert not hasattr(placeholder, "_private")
     with pytest.raises(TypeError, match="Cannot subclass"):
 
-        class Sub(placeholder):  # type: ignore[misc]
+        class Sub(placeholder):
             pass
 
 

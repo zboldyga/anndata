@@ -49,7 +49,7 @@ def _gen_dataframe_mapping(
     source: Literal["X", "shape"],
     attr: Literal["obs", "var"],
     length: int | None = None,
-) -> pd.DataFrame | Dataset2D:
+) -> pd.DataFrame:
     if isinstance(anno, XDataset):
         # `XDataset` is a lazy placeholder, which `singledispatch` ranks below
         # `xarray.Dataset`’s real base class `Mapping`, so dispatch manually.
