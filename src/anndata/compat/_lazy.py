@@ -36,8 +36,8 @@ __all__ = ["LazyType", "lazy_type", "lazy_type_for"]
 
 _LAZY_TYPES: list[LazyType] = []
 _REAL_TO_LAZY: dict[type, LazyType] = {}
-# guards first resolution (factories must run exactly once); reentrant for nested factories
-_RESOLVE_LOCK = threading.RLock()
+# guards publishing a resolved class (never held while importing or running factories)
+_PUBLISH_LOCK = threading.Lock()
 
 
 class LazyType(ABCMeta):
@@ -48,6 +48,7 @@ class LazyType(ABCMeta):
     _lazy_factory: Callable[[], type] | None
     _lazy_on_resolve: Callable[[type], None] | None
     _lazy_real: type | None
+    _lazy_publishing: bool
 
     def __new__(
         mcls, name: str, bases: tuple[type, ...], namespace: dict[str, object], /, **kw
@@ -67,29 +68,40 @@ class LazyType(ABCMeta):
         """
         if (real := cls._lazy_real) is not None:
             return real
-        mod: ModuleType | None
-        if import_:
-            try:
-                mod = import_module(cls._lazy_module)
-            except ImportError:
-                return None
-        elif (mod := sys.modules.get(cls._lazy_module)) is None:
+        if cls._lazy_publishing:  # re-entrant check during `ABCMeta.register` below
             return None
-        with _RESOLVE_LOCK:
-            if (real := cls._lazy_real) is not None:  # resolved by another thread
-                return real
-            if cls._lazy_factory is not None:
-                real = cls._lazy_factory()
-            elif (real := getattr(mod, cls._lazy_name, None)) is None:
-                return None  # e.g. the module is still being initialized
-            cls._lazy_real = real
-            _REAL_TO_LAZY[real] = cls
-            # Registering as a virtual subclass bumps the ABC cache token,
-            # which invalidates negative `isinstance` caches and `singledispatch` caches.
-            ABCMeta.register(cls, real)
+        if (mod := cls._lazy_module_obj(import_=import_)) is None:
+            return None
+        # No lock is held here: factories import modules, and holding a lock across
+        # imports can deadlock with the import lock of a thread initializing the module.
+        if cls._lazy_factory is not None:
+            real = cls._lazy_factory()
+        elif (real := getattr(mod, cls._lazy_name, None)) is None:
+            return None  # e.g. the module is still being initialized
+        with _PUBLISH_LOCK:
+            if (published := cls._lazy_real) is not None:
+                return published  # another thread won; discard ours
+            cls._lazy_publishing = True
+            try:
+                # Register the real class as a virtual subclass *before* publishing it:
+                # this bumps the ABC cache token, invalidating stale negative `isinstance`
+                # results and `singledispatch` caches (also for subclasses of `real`).
+                ABCMeta.register(cls, real)
+                cls._lazy_real = real
+                _REAL_TO_LAZY[real] = cls
+            finally:
+                cls._lazy_publishing = False
         if cls._lazy_on_resolve is not None:
             cls._lazy_on_resolve(real)
         return real
+
+    def _lazy_module_obj(cls, *, import_: bool) -> ModuleType | None:
+        if not import_:
+            return sys.modules.get(cls._lazy_module)
+        try:
+            return import_module(cls._lazy_module)
+        except ImportError:
+            return None
 
     def _lazy_require(cls) -> type:
         """Get the real class, importing its module. Raises `ImportError` if not installed."""
@@ -170,6 +182,7 @@ def lazy_type(
         _lazy_factory=factory,
         _lazy_on_resolve=on_resolve,
         _lazy_real=None,
+        _lazy_publishing=False,
     )
     typ = LazyType(name, (), ns)
     _LAZY_TYPES.append(typ)

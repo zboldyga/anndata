@@ -236,3 +236,137 @@ def test_gen_adata_accepts_real_types():
 
     adata = gen_adata((5, 4), obsm_types=(*DEFAULT_KEY_TYPES, da.Array))
     assert isinstance(adata.obsm["da"], da.Array)
+
+
+def test_resolution_invalidates_negative_cache_for_subclasses():
+    """Like above, but the cached negative result is for a *subclass* of the real class."""
+    import types
+
+    name = "anndata_test_partial_pkg_sub"
+    mod = types.ModuleType(name)
+    sys.modules[name] = mod
+    try:
+        placeholder = lazy_type(name, "Base")
+
+        class Base:
+            pass
+
+        class Child(Base):
+            pass
+
+        @singledispatch
+        def f(_) -> str:
+            return "default"
+
+        @f.register(placeholder)
+        def _(_) -> str:
+            return "base"
+
+        child = Child()
+        assert not isinstance(child, placeholder)
+        assert not issubclass(Child, placeholder)
+        assert f(child) == "default"
+        mod.Base = Base
+        assert placeholder._lazy_get() is Base
+        assert isinstance(child, placeholder)
+        assert issubclass(Child, placeholder)
+        assert f(child) == "base"
+    finally:
+        del sys.modules[name]
+
+
+def test_factory_import_does_not_deadlock():
+    """A factory importing a module while another thread initializes it must not deadlock.
+
+    Thread A imports a stub module whose initialization checks an object against the
+    placeholder; thread B resolves a factory placeholder whose factory imports that module.
+    """
+    import importlib.abc
+    import importlib.util
+    import threading
+
+    name = "anndata_test_deadlock_pkg"
+    placeholder = lazy_type(name, "Built", factory=lambda: type("Built", (), {}))
+    b_started = threading.Event()
+
+    class Loader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            # module is in `sys.modules` but still initializing; let B start resolving
+            b_started.wait(timeout=5)
+            isinstance(object(), placeholder)
+            module.Thing = type("Thing", (), {})
+
+    class Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == name:
+                return importlib.util.spec_from_loader(fullname, Loader())
+            return None
+
+    finder = Finder()
+    sys.meta_path.insert(0, finder)
+    try:
+        results: list[object] = []
+
+        def thread_a() -> None:
+            results.append(importlib.import_module(name))
+
+        def thread_b() -> None:
+            while name not in sys.modules:  # wait until A is initializing the module
+                pass
+            b_started.set()
+            results.append(placeholder._lazy_get())
+
+        threads = [threading.Thread(target=thread_a), threading.Thread(target=thread_b)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads), "deadlock"
+        assert len(results) == 2
+    finally:
+        sys.meta_path.remove(finder)
+        sys.modules.pop(name, None)
+
+
+@pytest.mark.skipif(find_spec("cupy") is not None, reason="cupy is installed")
+@pytest.mark.parametrize("array_api", [False, True], ids=["plain", "array_api"])
+def test_assert_equal_cupy_stub(*, array_api: bool):
+    """`assert_equal` reaches the cupy handler whether or not cupy arrays satisfy the array-API protocol."""
+    extra = (
+        """
+    device = "cuda"
+    def __array_namespace__(self): return np
+    def to_device(self, device): return self
+"""
+        if array_api
+        else ""
+    )
+    code = f"""
+import sys, types
+import numpy as np
+from anndata.tests.helpers import assert_equal  # before stubbing: helpers' deps probe for cupy
+cupy = types.ModuleType("cupy")
+class ndarray:
+    def __init__(self, a): self._a = np.asarray(a)
+    dtype = np.dtype("f8"); ndim = 1; shape = (2,); size = 2
+    def get(self): return self._a
+    def __getitem__(self, k): return self._a[k]
+{extra}
+cupy.ndarray = ndarray
+sys.modules["cupy"] = cupy
+assert_equal(ndarray([1., 2.]), np.array([1., 2.]))
+try:
+    assert_equal(ndarray([1., 2.]), np.array([1., 3.]))
+except AssertionError:
+    pass
+else:
+    raise SystemExit("unequal arrays compared equal")
+print("ok")
+"""
+    out = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    )
+    assert out.stdout.strip() == "ok"

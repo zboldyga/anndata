@@ -181,8 +181,12 @@ else:
     XBackendArray = lazy_type("xarray.backends", "BackendArray")
     XZarrArrayWrapper = lazy_type("xarray.backends.zarr", "ZarrArrayWrapper")
 
+    def _register_cupy_dask_chunk_types(_: type) -> None:
+        """`on_resolve` hook of the cupy placeholders, see below."""
+        _register_cupy_dask_chunk_types_once()
+
     @cache
-    def _register_cupy_dask_chunk_types(_: type | None = None) -> None:
+    def _register_cupy_dask_chunk_types_once() -> None:
         """Allow dask arrays with cupy sparse chunks.
 
         Runs once, when anndata first resolves a cupy placeholder
