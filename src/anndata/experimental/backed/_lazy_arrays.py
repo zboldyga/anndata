@@ -110,10 +110,9 @@ class CategoricalArray[K: (h5py.Dataset, zarr.Array)](XBackendArray):
 
     @cached_property
     def categories(self) -> np.ndarray:
-        if isinstance(self._categories, zarr.Array):
-            return np.asarray(self._categories[...])
         from anndata.io import read_elem
 
+        # Honor the categories' encoding (e.g. `datetime-array`) instead of reading raw values
         return np.asarray(read_elem(self._categories))
 
     def __getitem__(self, key: ExplicitIndexer) -> PandasExtensionArray:

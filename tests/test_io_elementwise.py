@@ -782,6 +782,15 @@ def test_write_io_error(store, obj):
             id="pd_datetime_tz_fixed_negative",
         ),
         pytest.param(
+            # outside the range of `datetime.datetime`
+            pd.array(
+                np.array(["12000-01-01", "NaT"], dtype="datetime64[s]")
+            ).tz_localize("UTC"),
+            "datetime-array",
+            "UTC",
+            id="pd_datetime_tz_far_future",
+        ),
+        pytest.param(
             pd.array(pd.to_timedelta([1, None, 3], unit="s")),
             "timedelta-array",
             None,
@@ -843,8 +852,26 @@ def test_io_datetime_like(
     if tz is not None:
         assert isinstance(first, pd.Timestamp)
         assert first == from_disk[0]
+        assert first.unit == value.unit
     else:
         np.testing.assert_array_equal(first, from_disk[0])
+
+    # Round-tripping a (dask backed) lazily read array goes through the same encoding
+    key_copy = f"{key}_copy"
+    with (
+        pytest.warns(UserWarning, match=r"returned as timezone-naive UTC")
+        if tz is not None
+        else nullcontext()
+    ):
+        write_elem(store, key_copy, read_elem_lazy(elem))
+    assert _read_attr(store[key_copy].attrs, "encoding-type") == encoding_type
+    assert _read_attr(store[key_copy].attrs, "unit") == expected_unit
+    np.testing.assert_array_equal(
+        read_elem(store[key_copy]),
+        np.asarray(value.tz_convert("UTC").tz_localize(None))
+        if isinstance(value, pd.arrays.DatetimeArray) and tz is not None
+        else np.asarray(value),
+    )
 
     # Lazy reads produce dask arrays of the right dtype (timezones can not be represented)
     expected_lazy = (
@@ -904,6 +931,10 @@ def test_read_lazy_dataframe_datetime_columns(store: _GroupStorageType) -> None:
         {
             "datetime": np.array(["2020-01-01", "NaT"], dtype="datetime64[s]"),
             "timedelta": np.array([1, "NaT"], dtype="timedelta64[s]"),
+            "datetime_cat": pd.Categorical(
+                pd.to_datetime(["2020-01-01", "2021-01-01"])
+            ),
+            "timedelta_cat": pd.Categorical(pd.to_timedelta([1, 2], unit="s")),
         },
         index=["a", "b"],
     )

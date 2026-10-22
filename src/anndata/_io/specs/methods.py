@@ -1436,14 +1436,10 @@ _DATETIME_SPEC = IOSpec("datetime-array", "0.1.0")
 _TIMEDELTA_SPEC = IOSpec("timedelta-array", "0.1.0")
 
 
-def _write_datetime_like(
-    f: _GroupStorageType,
-    k: str,
-    elem: np.ndarray,
-    *,
-    _writer: Writer,
-    dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
-) -> None:
+def _check_datetime_like_write(
+    elem: np.ndarray | DaskArray, dataset_kwargs: Mapping[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Validate a datetime-like array for writing; returns its unit and the cleaned `dataset_kwargs`."""
     if elem.ndim == 0:
         msg = f"Writing zero-dimensional {elem.dtype} arrays is not supported."
         raise NotImplementedError(msg)
@@ -1460,9 +1456,37 @@ def _write_datetime_like(
     ) != np.dtype(np.int64):
         msg = f"Datetime-like arrays are stored as int64 counts, got dtype={dtype!r} in dataset_kwargs."
         raise ValueError(msg)
+    return unit, dataset_kwargs
+
+
+def _write_datetime_like(
+    f: _GroupStorageType,
+    k: str,
+    elem: np.ndarray,
+    *,
+    _writer: Writer,
+    dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
+) -> None:
+    unit, dataset_kwargs = _check_datetime_like_write(elem, dataset_kwargs)
     # Convert to native byte order (a no-op copy-free cast for native input) before viewing
     counts = np.asarray(elem, dtype=elem.dtype.newbyteorder("=")).view(np.int64)
     write_basic(f, k, counts, _writer=_writer, dataset_kwargs=dataset_kwargs)
+    f[k].attrs["unit"] = unit
+
+
+def _write_datetime_like_dask(
+    f: _GroupStorageType,
+    k: str,
+    elem: DaskArray,
+    *,
+    _writer: Writer,
+    dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
+) -> None:
+    unit, dataset_kwargs = _check_datetime_like_write(elem, dataset_kwargs)
+    counts = elem.astype(elem.dtype.newbyteorder("=")).view(np.int64)
+    write_basic_dask_dask_dense(
+        f, k, counts, _writer=_writer, dataset_kwargs=dataset_kwargs
+    )
     f[k].attrs["unit"] = unit
 
 
@@ -1525,9 +1549,9 @@ def _localize_datetime_array(
     if tz is None:
         return values
     # Stored values are UTC based, so localizing to UTC is unambiguous
-    if values.ndim == 0:
-        return pd.Timestamp(values.item()).tz_localize("UTC").tz_convert(tz)
-    return pd.array(values).tz_localize("UTC").tz_convert(tz)
+    localized = pd.array(values.reshape(-1)).tz_localize("UTC").tz_convert(tz)
+    # A scalar selection becomes a timestamp (going through the array keeps the unit)
+    return localized[0] if values.ndim == 0 else localized
 
 
 for _store_type in _STORE_TYPES:
@@ -1538,6 +1562,13 @@ for _store_type in _STORE_TYPES:
         _REGISTRY.register_write(_store_type, (_array_type, "m"), _TIMEDELTA_SPEC)(
             _write_datetime_like
         )
+    for _dask_type in (DaskArray, views.DaskArrayView):
+        _REGISTRY.register_write(
+            _store_type, (_dask_type, np.ndarray, "M"), _DATETIME_SPEC
+        )(_write_datetime_like_dask)
+        _REGISTRY.register_write(
+            _store_type, (_dask_type, np.ndarray, "m"), _TIMEDELTA_SPEC
+        )(_write_datetime_like_dask)
 
 
 @_REGISTRY.register_write(h5py.Group, pd.arrays.DatetimeArray, _DATETIME_SPEC)

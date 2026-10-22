@@ -615,7 +615,8 @@ array(['2018-01-01T00:00:00.000000', '2018-01-01T01:00:00.000000',
        '2018-01-01T02:00:00.000000'], dtype='datetime64[us]')
 ```
 
-Timezone-aware pandas arrays are converted to UTC before writing and read back as timezone-aware {class}`pandas.arrays.DatetimeArray`\ s:
+Timezone-aware pandas arrays are converted to UTC before writing and read back as timezone-aware {class}`pandas.arrays.DatetimeArray`\ s
+(lazy reading via {func}`anndata.experimental.read_elem_lazy` returns the timezone-naive UTC values with a warning, since dask arrays cannot carry a timezone):
 
 ```python
 >>> write_elem(store, "datetimes_tz", pd.array(datetimes.tz_localize("Europe/Berlin")))
