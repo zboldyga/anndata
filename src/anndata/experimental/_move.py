@@ -168,7 +168,7 @@ def move_to_obs(
     Returns
     -------
     A new :class:`~anndata.AnnData` with ``n_vars`` reduced by the number of moved variables.
-    The object must be in memory (not backed).
+    The object must be in memory (not backed); like :func:`anndata.concat`, masks on ``X`` or ``layers`` are not preserved.
 
     See Also
     --------
@@ -231,7 +231,7 @@ def move_to_var(
     Returns
     -------
     A new :class:`~anndata.AnnData` with ``n_obs`` reduced by the number of moved observations.
-    The object must be in memory (not backed).
+    The object must be in memory (not backed); like :func:`anndata.concat`, masks on ``X`` or ``layers`` are not preserved.
     If ``adata.raw`` is set, it is subset along with ``X``.
 
     See Also
