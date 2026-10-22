@@ -189,9 +189,12 @@ else:
     def _register_cupy_dask_chunk_types_once() -> None:
         """Allow dask arrays with cupy sparse chunks.
 
-        Runs once, when anndata first resolves a cupy placeholder
+        Runs when anndata first resolves a cupy placeholder
         (i.e. once cupy is imported and anndata checks an object against a cupy type),
-        and imports dask if it is installed.
+        and imports dask if it is installed. The shared cache avoids repeated sequential
+        registration; concurrent cache misses may repeat these idempotent calls.
+        The class is published before this hook runs, so another resolver can return
+        before registration finishes.
         """
         try:
             import dask.array as da

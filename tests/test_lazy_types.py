@@ -164,7 +164,7 @@ def test_resolution_invalidates_negative_cache():
         del sys.modules[name]
 
 
-def test_factory_runs_once_across_threads():
+def test_factory_publishes_one_class_across_threads():
     import threading
     import types
 
@@ -172,12 +172,17 @@ def test_factory_runs_once_across_threads():
     sys.modules[name] = types.ModuleType(name)
     try:
         calls = []
+        in_factory = threading.Barrier(8, timeout=10)
+        callbacks = []
 
         def factory() -> type:
             calls.append(1)
+            in_factory.wait()  # force concurrent construction, including GIL builds
             return type("Built", (), {})
 
-        placeholder = lazy_type(name, "Built", factory=factory)
+        placeholder = lazy_type(
+            name, "Built", factory=factory, on_resolve=callbacks.append
+        )
         barrier = threading.Barrier(8)
         results: list[type | None] = []
 
@@ -189,9 +194,13 @@ def test_factory_runs_once_across_threads():
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
-        assert len(calls) == 1
+            t.join(timeout=15)
+        assert not any(t.is_alive() for t in threads)
+        assert len(calls) == 8
+        assert len(results) == 8
+        assert all(r is not None for r in results)
         assert len({id(r) for r in results}) == 1
+        assert callbacks == [results[0]]
         assert lazy_type_for(results[0]) is placeholder
     finally:
         del sys.modules[name]
@@ -275,60 +284,137 @@ def test_resolution_invalidates_negative_cache_for_subclasses():
         del sys.modules[name]
 
 
-def test_factory_import_does_not_deadlock():
-    """A factory importing a module while another thread initializes it must not deadlock.
+@pytest.mark.skipif(find_spec("awkward") is None, reason="awkward not installed")
+def test_awkward_factory_does_not_publish_discarded_classes():
+    """Only the resolved class may become Awkward's globally registered behavior."""
+    import awkward as ak
 
-    Thread A imports a stub module whose initialization checks an object against the
-    placeholder; thread B resolves a factory placeholder whose factory imports that module.
+    from anndata._core.views import (
+        AwkwardArrayView,
+        _make_awkward_array_view,
+        as_view_awkarray,
+    )
+
+    adata = ad.AnnData(np.ones((2, 1)))
+    array = ak.Array([[1], [2, 3]])
+    view = as_view_awkarray(array, (adata, "obsm", ("a",)))
+    real = AwkwardArrayView._lazy_require()
+    assert type(view) is real
+    # A competing factory can finish after publication. It must have no side effects.
+    discarded = _make_awkward_array_view()
+    assert discarded is not real
+    assert ak.behavior["AwkwardArrayView"] is real
+    assert type(as_view_awkarray(array, (adata, "obsm", ("a",)))) is real
+
+
+def test_dispatch_after_late_publication_requires_resolution():
+    """Document the boundary of ABC invalidation for dynamically published classes.
+
+    A dispatcher cache hit cannot call the placeholder. Code exposing instances during
+    module initialization must resolve the placeholder before reusing that dispatcher.
+    Normal imports finish publishing classes before exposing instances to anndata.
     """
-    import importlib.abc
-    import importlib.util
-    import threading
+    import types
 
-    name = "anndata_test_deadlock_pkg"
-    placeholder = lazy_type(name, "Built", factory=lambda: type("Built", (), {}))
-    b_started = threading.Event()
-
-    class Loader(importlib.abc.Loader):
-        def create_module(self, spec):
-            return None
-
-        def exec_module(self, module):
-            # module is in `sys.modules` but still initializing; let B start resolving
-            b_started.wait(timeout=5)
-            isinstance(object(), placeholder)
-            module.Thing = type("Thing", (), {})
-
-    class Finder(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path, target=None):
-            if fullname == name:
-                return importlib.util.spec_from_loader(fullname, Loader())
-            return None
-
-    finder = Finder()
-    sys.meta_path.insert(0, finder)
+    name = "anndata_test_dispatch_publication"
+    mod = types.ModuleType(name)
+    sys.modules[name] = mod
     try:
-        results: list[object] = []
+        placeholder = lazy_type(name, "Base")
 
-        def thread_a() -> None:
-            results.append(importlib.import_module(name))
+        class Base:
+            pass
 
-        def thread_b() -> None:
-            while name not in sys.modules:  # wait until A is initializing the module
-                pass
-            b_started.set()
-            results.append(placeholder._lazy_get())
+        class Child(Base):
+            pass
 
-        threads = [threading.Thread(target=thread_a), threading.Thread(target=thread_b)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
-        assert not any(t.is_alive() for t in threads), "deadlock"
-        assert len(results) == 2
+        @singledispatch
+        def f(_) -> str:
+            return "default"
+
+        @f.register(placeholder)
+        def _(_) -> str:
+            return "base"
+
+        child = Child()
+        assert f(child) == "default"
+        mod.Base = Base
+        assert f(child) == "default"  # cached dispatch never consults the placeholder
+        assert placeholder._lazy_require() is Base
+        assert f(child) == "base"  # resolution invalidates the cached dispatch
     finally:
-        sys.meta_path.remove(finder)
-        sys.modules.pop(name, None)
+        del sys.modules[name]
+
+
+def test_factory_import_does_not_deadlock():
+    """Bound the real import-lock race in a subprocess so regressions cannot hang pytest."""
+    code = """
+import importlib.abc, importlib.util, sys, threading
+from anndata.compat._lazy import lazy_type
+name = "anndata_test_deadlock_pkg"
+initializing = threading.Event()
+checked = threading.Event()
+results = {}
+errors = []
+factory_calls = []
+
+def factory():
+    factory_calls.append(1)
+    module = importlib.import_module(name)
+    return type("Built", (module.Thing,), {})
+
+placeholder = lazy_type(name, "Built", factory=factory)
+
+class Loader(importlib.abc.Loader):
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        initializing.set()
+        assert checked.wait(5)
+        assert not isinstance(object(), placeholder)
+        assert not factory_calls
+        module.Thing = type("Thing", (), {})
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == name:
+            return importlib.util.spec_from_loader(fullname, Loader())
+
+sys.meta_path.insert(0, Finder())
+
+def thread_a():
+    try:
+        results["module"] = importlib.import_module(name)
+    except BaseException as e:
+        errors.append(e)
+
+def thread_b():
+    try:
+        assert initializing.wait(5)
+        # A non-importing check must defer, even though sys.modules has the module.
+        assert placeholder._lazy_get() is None
+        checked.set()
+        # Explicit resolution waits for import completion before running the factory.
+        results["class"] = placeholder._lazy_require()
+    except BaseException as e:
+        errors.append(e)
+
+threads = [threading.Thread(target=f, daemon=True) for f in (thread_a, thread_b)]
+for t in threads: t.start()
+for t in threads: t.join(timeout=10)
+assert not any(t.is_alive() for t in threads), "deadlock"
+assert not errors, errors
+assert len(results) == 2
+assert len(factory_calls) == 1
+assert placeholder._lazy_get() is results["class"]
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
 
 
 @pytest.mark.skipif(find_spec("cupy") is not None, reason="cupy is installed")
@@ -370,3 +456,86 @@ print("ok")
         [sys.executable, "-c", code], check=True, capture_output=True, text=True
     )
     assert out.stdout.strip() == "ok"
+
+
+@pytest.mark.skipif(find_spec("dask") is None, reason="dask not installed")
+def test_view_io_during_type_publication():
+    """A concurrent constructor must not expose a view before its IO key exists.
+
+    Gate mapping insertion until the consumer either completes (the broken fast
+    path) or enters a competing factory (the correct, still-unpublished path).
+    This forces the publication interval without sleeps or source-line tracing.
+    """
+    code = """
+import threading
+import numpy as np
+import dask.array as da
+import h5py
+import anndata as ad
+from anndata._core.views import DaskArrayView
+from anndata.compat import _lazy
+from anndata.io import read_elem, write_elem
+
+base = da.ones((2, 2), chunks=(1, 1))
+ad.AnnData(base)
+f = h5py.File("race.h5", "w", driver="core", backing_store=False)
+write_elem(f, "base", base)
+assert DaskArrayView._lazy_real is None
+
+inserting = threading.Event()
+consumer_progress = threading.Event()
+errors = []
+normalized = []
+factory = DaskArrayView._lazy_factory
+
+def build():
+    if threading.current_thread().name == "consumer":
+        consumer_progress.set()
+    return factory()
+
+class GatedMapping(dict):
+    def __setitem__(self, real, placeholder):
+        if placeholder is DaskArrayView:
+            inserting.set()
+            assert consumer_progress.wait(5)
+        super().__setitem__(real, placeholder)
+
+DaskArrayView._lazy_factory = build
+_lazy._REAL_TO_LAZY = GatedMapping(_lazy._REAL_TO_LAZY)
+
+def publish():
+    try:
+        DaskArrayView._lazy_require()
+    except BaseException as e:
+        errors.append(e)
+
+def consume():
+    try:
+        view = DaskArrayView(base)
+        normalized.append(_lazy.lazy_type_for(type(view)))
+        write_elem(f, "view", view)
+    except BaseException as e:
+        errors.append(e)
+    finally:
+        consumer_progress.set()
+
+publisher = threading.Thread(target=publish, daemon=True)
+consumer = threading.Thread(target=consume, name="consumer", daemon=True)
+publisher.start()
+assert inserting.wait(5)
+consumer.start()
+publisher.join(10)
+consumer.join(10)
+assert not publisher.is_alive() and not consumer.is_alive(), "deadlock"
+assert not errors, errors
+assert normalized == [DaskArrayView], normalized
+np.testing.assert_array_equal(read_elem(f["view"]), np.ones((2, 2)))
+f.close()
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )

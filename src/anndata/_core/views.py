@@ -493,7 +493,6 @@ def _make_awkward_array_view() -> type[AwkArray]:
             array = ak.with_parameter(array, "__list__", None)
             return array
 
-    ak.behavior["AwkwardArrayView"] = AwkwardArrayView
     return AwkwardArrayView
 
 
@@ -510,7 +509,7 @@ def as_view_awkarray(array, view_args):
     import awkward as ak
 
     # make sure the `AwkwardArrayView` behavior is registered with awkward
-    AwkwardArrayView._lazy_require()
+    ak.behavior["AwkwardArrayView"] = AwkwardArrayView._lazy_require()
 
     parent, attrname, keys = view_args
     parent_key = f"target-{id(parent)}"
