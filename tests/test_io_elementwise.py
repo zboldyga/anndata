@@ -704,7 +704,7 @@ def test_write_io_error(store, obj):
     assert re.search(full_pattern, msg)
 
 
-@pytest.mark.parametrize(
+DATETIME_LIKE_CASES = pytest.mark.parametrize(
     ("value", "encoding_type", "tz"),
     [
         pytest.param(
@@ -809,6 +809,27 @@ def test_write_io_error(store, obj):
         ),
     ],
 )
+
+
+def _expected_unit(
+    value: np.ndarray | pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray,
+) -> str:
+    """The unit is whatever the input had (which depends on the pandas version for pandas inputs)."""
+    if isinstance(value, pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray):
+        return value.unit
+    return np.datetime_data(value.dtype)[0]
+
+
+def _expected_naive(
+    value: np.ndarray | pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray,
+) -> np.ndarray:
+    """The timezone-naive (UTC) numpy equivalent of `value`."""
+    if isinstance(value, pd.arrays.DatetimeArray) and value.tz is not None:
+        return np.asarray(value.tz_convert("UTC").tz_localize(None))
+    return np.asarray(value)
+
+
+@DATETIME_LIKE_CASES
 def test_io_datetime_like(
     store: _GroupStorageType,
     value: np.ndarray | pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray,
@@ -822,13 +843,7 @@ def test_io_datetime_like(
     elem = store[key]
     assert isinstance(elem, h5py.Dataset | zarr.Array)
     assert _read_attr(elem.attrs, "encoding-type") == encoding_type
-    # The unit is whatever the input had (which depends on the pandas version for pandas inputs)
-    expected_unit = (
-        value.unit
-        if isinstance(value, pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray)
-        else np.datetime_data(value.dtype)[0]
-    )
-    assert _read_attr(elem.attrs, "unit") == expected_unit
+    assert _read_attr(elem.attrs, "unit") == _expected_unit(value)
     assert _read_attr(elem.attrs, "tz", default=None) == tz
     # On disk, the counts are stored as plain integers
     assert np.dtype(elem.dtype) == np.dtype(np.int64)
@@ -865,49 +880,46 @@ def test_io_datetime_like(
     assert partial.shape == (len(value) - 1, *value.shape[1:])
     assert read_elem_partial(elem, indices=slice(0, 0)).shape == (0, *value.shape[1:])
     first = read_elem_partial(elem, indices=0)
+    expected_first = from_disk[0]
     if tz is not None and value.ndim == 1:
         assert isinstance(first, pd.Timestamp)
         assert isinstance(value, pd.arrays.DatetimeArray)
-        assert first == from_disk[0]
+        assert first == expected_first
         assert first.unit == value.unit
     elif tz is not None:
         assert isinstance(first, pd.arrays.DatetimeArray)
-        pd.testing.assert_extension_array_equal(first, from_disk[0])
+        assert isinstance(expected_first, pd.arrays.DatetimeArray)
+        pd.testing.assert_extension_array_equal(first, expected_first)
     else:
-        np.testing.assert_array_equal(first, from_disk[0])
+        np.testing.assert_array_equal(first, expected_first)
+
+
+@DATETIME_LIKE_CASES
+def test_io_datetime_like_lazy(
+    store: _GroupStorageType,
+    value: np.ndarray | pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray,
+    encoding_type: str,
+    tz: str | None,
+) -> None:
+    """Lazy reads produce dask arrays of the right dtype (timezones can not be represented)."""
+    key = f"key_for_{encoding_type}"
+    write_elem(store, key, value)
+    expected = _expected_naive(value)
+    warns_tz = pytest.warns(UserWarning, match=r"returned as timezone-naive UTC")
+
+    with warns_tz if tz is not None else nullcontext():
+        lazy = read_elem_lazy(store[key])
+    assert isinstance(lazy, DaskArray)
+    assert lazy.dtype == expected.dtype.newbyteorder("=")
+    np.testing.assert_array_equal(lazy.compute(), expected)
 
     # Round-tripping a (dask backed) lazily read array goes through the same encoding
     key_copy = f"{key}_copy"
-    with (
-        pytest.warns(UserWarning, match=r"returned as timezone-naive UTC")
-        if tz is not None
-        else nullcontext()
-    ):
-        write_elem(store, key_copy, read_elem_lazy(elem))
+    with warns_tz if tz is not None else nullcontext():
+        write_elem(store, key_copy, read_elem_lazy(store[key]))
     assert _read_attr(store[key_copy].attrs, "encoding-type") == encoding_type
-    assert _read_attr(store[key_copy].attrs, "unit") == expected_unit
-    np.testing.assert_array_equal(
-        read_elem(store[key_copy]),
-        np.asarray(value.tz_convert("UTC").tz_localize(None))
-        if isinstance(value, pd.arrays.DatetimeArray) and tz is not None
-        else np.asarray(value),
-    )
-
-    # Lazy reads produce dask arrays of the right dtype (timezones can not be represented)
-    expected_lazy = (
-        np.asarray(value.tz_convert("UTC").tz_localize(None))
-        if isinstance(value, pd.arrays.DatetimeArray) and tz is not None
-        else np.asarray(value)
-    )
-    with (
-        pytest.warns(UserWarning, match=r"timezone.*returned as timezone-naive UTC")
-        if tz is not None
-        else nullcontext()
-    ):
-        lazy = read_elem_lazy(elem)
-    assert isinstance(lazy, DaskArray)
-    assert lazy.dtype == expected_lazy.dtype.newbyteorder("=")
-    np.testing.assert_array_equal(lazy.compute(), expected_lazy)
+    assert _read_attr(store[key_copy].attrs, "unit") == _expected_unit(value)
+    np.testing.assert_array_equal(read_elem(store[key_copy]), expected)
 
 
 def test_read_datetime_partial_orthogonal(store: _GroupStorageType) -> None:
