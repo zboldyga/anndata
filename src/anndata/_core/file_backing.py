@@ -7,9 +7,10 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import h5py
+import numpy as np
 import zarr
 
-from ..compat import AwkArray, DaskArray
+from ..compat import AwkArray, CSArray, CSMatrix, DaskArray
 from .sparse_dataset import BaseCompressedSparseDataset
 from .xarray import Dataset2D
 
@@ -161,8 +162,42 @@ def _(x: BaseCompressedSparseDataset, *, copy: bool = False):
     return x.to_memory()
 
 
+def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray:
+    """Materialize a dask array of scipy sparse chunks without dask’s final concatenation.
+
+    :meth:`dask.array.Array.compute` concatenates the computed chunks with
+    :func:`~scipy.sparse.hstack` per block row and then :func:`~scipy.sparse.vstack`,
+    which copies the data twice and keeps all intermediates alive at once.
+    Computing the chunks in one scheduler pass and stacking them directly
+    with scipy keeps the parallelism but avoids the extra copies.
+    See https://github.com/scverse/anndata/issues/2185
+    """
+    import dask
+    from scipy import sparse
+
+    if x.ndim != 2:  # pragma: no cover
+        msg = f"Expected a 2D sparse dask array, got {x.ndim}D"
+        raise ValueError(msg)
+    fmt = x._meta.format
+    grid = x.to_delayed()
+    # one scheduler pass computes all blocks in parallel (same as `.compute()`)
+    blocks = np.empty(grid.shape, dtype=object)
+    for i, block in enumerate(dask.compute(*grid.ravel())):
+        blocks.flat[i] = block
+    n_block_rows, n_block_cols = blocks.shape
+    if n_block_cols == 1:
+        rows = list(blocks[:, 0])
+    else:
+        rows = [sparse.hstack(list(row), format=fmt) for row in blocks]
+    if n_block_rows > 1 or not sparse.issparse(rows[0]):
+        return sparse.vstack(rows, format=fmt)
+    return rows[0].asformat(fmt)
+
+
 @to_memory.register(DaskArray)
 def _(x: DaskArray, *, copy: bool = False):
+    if isinstance(x._meta, CSMatrix | CSArray):
+        return _compute_sparse_blockwise(x)
     return x.compute()
 
 

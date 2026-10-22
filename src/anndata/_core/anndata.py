@@ -1428,6 +1428,10 @@ class AnnData:  # noqa: PLW1641
     def to_memory(self, *, copy: bool = False) -> AnnData:
         """Return a new AnnData object with all non-in-memory arrays loaded into memory.
 
+        Dask arrays with sparse chunks are materialized block by block and stacked
+        with :mod:`scipy.sparse`, which needs less peak memory than
+        :meth:`dask.array.Array.compute`.
+
         Params
         ------
         copy

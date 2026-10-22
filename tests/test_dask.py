@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from scipy import sparse
 from zarr.storage import MemoryStore
 
 import anndata as ad
@@ -403,6 +404,100 @@ def test_to_memory_copy_raw():
     assert isinstance(with_raw.raw.varm["da"], DaskArray)
     assert isinstance(curr.raw.X, np.ndarray)
     assert isinstance(curr.raw.varm["da"], np.ndarray)
+
+
+@pytest.mark.parametrize(
+    "sparse_type",
+    [
+        pytest.param(sparse.csr_matrix, id="csr_matrix"),
+        pytest.param(sparse.csc_matrix, id="csc_matrix"),
+        pytest.param(
+            sparse.csr_array,
+            id="csr_array",
+            marks=pytest.mark.skipif(
+                not DASK_CAN_SPARRAY, reason="Dask does not support sparrays"
+            ),
+        ),
+        pytest.param(
+            sparse.csc_array,
+            id="csc_array",
+            marks=pytest.mark.skipif(
+                not DASK_CAN_SPARRAY, reason="Dask does not support sparrays"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("shape", "chunks"),
+    [
+        pytest.param((50, 40), (10, -1), id="row_chunks"),
+        pytest.param((50, 40), (-1, 10), id="col_chunks"),
+        pytest.param((50, 40), (10, 10), id="grid_chunks"),
+        pytest.param((50, 40), (-1, -1), id="single_chunk"),
+        pytest.param((0, 40), (-1, -1), id="empty"),
+    ],
+)
+def test_to_memory_sparse_dask_blockwise(
+    sparse_type: type[CSMatrix | CSArray], shape: tuple[int, int], chunks
+) -> None:
+    """Sparse dask arrays are materialized block by block, see #2185."""
+    import dask.array as da
+
+    from anndata._core.file_backing import to_memory
+
+    mat = sparse_type(
+        sparse.random(
+            *shape, density=0.3, format="csr", random_state=np.random.default_rng(0)
+        )
+    )
+    x = da.from_array(mat, chunks=chunks)
+
+    result = to_memory(x)
+
+    assert isinstance(result, sparse_type)
+    assert result.format == mat.format
+    assert result.shape == mat.shape
+    assert_equal(result, mat)
+    assert_equal(result, x.compute())
+
+
+def test_to_memory_sparse_dask_single_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blockwise materialization computes all chunks in one scheduler pass
+    and bypasses dask’s own concatenation (which copies sparse chunks twice)."""
+    import dask
+    import dask.array as da
+    from dask.array import core as da_core
+
+    from anndata._core.file_backing import to_memory
+
+    mat = sparse.random(
+        60, 20, density=0.3, format="csr", random_state=np.random.default_rng(0)
+    )
+    x = da.from_array(mat, chunks=(10, 10))
+    n_passes = 0
+
+    def counting_get(dsk, keys, **kwargs):
+        nonlocal n_passes
+        n_passes += 1
+        return dask.get(dsk, keys, **kwargs)
+
+    def failing_concatenate3(arrays):
+        msg = "dask’s final concatenation should not be used for sparse chunks"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(da_core, "concatenate3", failing_concatenate3)
+
+    with dask.config.set(scheduler=counting_get):
+        result = to_memory(x)
+    assert n_passes == 1
+    assert_equal(result, mat)
+
+    # dense arrays keep using dask’s concatenation, which fills a preallocated result
+    with (
+        pytest.raises(AssertionError, match="final concatenation"),
+        dask.config.set(scheduler=counting_get),
+    ):
+        to_memory(da.from_array(mat.toarray(), chunks=(10, 10)))
 
 
 SMALL_SHARD_WARNING = r"dask chunk size is less than 100MB"
