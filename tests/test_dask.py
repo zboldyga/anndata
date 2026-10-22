@@ -478,7 +478,9 @@ def test_to_memory_sparse_dask_single_chunk_no_alias(
         x = x.persist()
 
     result = ad.AnnData(x).to_memory(copy=copy)
-    result.X.data[:] = 99
+    loaded = result.X
+    assert isinstance(loaded, CSMatrix)
+    loaded.data[:] = 99
 
     np.testing.assert_array_equal(x.compute().toarray(), np.eye(3))
 
@@ -512,6 +514,8 @@ def test_to_memory_sparse_dask_anndata_elements() -> None:
 
     mem = adata.to_memory()
 
+    assert adata.raw is not None
+    assert mem.raw is not None
     for lazy, loaded in [
         (adata.X, mem.X),
         (adata.layers["csc_grid"], mem.layers["csc_grid"]),
@@ -519,6 +523,7 @@ def test_to_memory_sparse_dask_anndata_elements() -> None:
         (adata.raw.X, mem.raw.X),
     ]:
         assert isinstance(lazy, DaskArray)
+        assert isinstance(loaded, CSMatrix | CSArray)
         computed = lazy.compute()
         assert type(loaded) is type(computed)
         assert loaded.format == computed.format
