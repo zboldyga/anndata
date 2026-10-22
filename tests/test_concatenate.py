@@ -1944,3 +1944,61 @@ def test_concat_merge_equal_dense_and_sparse_order_independent(merge_strategy):
     )
     assert "m" in concat([dense, sp], merge=merge_strategy).varm
     assert "m" in concat([sp, dense], merge=merge_strategy).varm
+
+
+@pytest.mark.parametrize("merge_strategy", ["same", "unique"])
+def test_concat_merge_dask_vs_numpy_equality_is_eager_and_dtype_aware(merge_strategy):
+    """A dask array is compared in memory with a non-dask array, in either order.
+
+    Values must match *and* so must the dtype, as for two in-memory arrays.
+    """
+    da = pytest.importorskip("dask.array")
+    var = pd.DataFrame(index=["a", "b"])
+    lazy = AnnData(obs=pd.DataFrame(index=["s1"]), var=var, varm={"m": da.ones((2, 2))})
+    same = AnnData(obs=pd.DataFrame(index=["s2"]), var=var, varm={"m": np.ones((2, 2))})
+    other_dtype = AnnData(
+        obs=pd.DataFrame(index=["s2"]),
+        var=var,
+        varm={"m": np.ones((2, 2), dtype=np.float32)},
+    )
+    for first, second in [(lazy, same), (same, lazy)]:
+        assert "m" in concat([first, second], merge=merge_strategy).varm
+    for first, second in [(lazy, other_dtype), (other_dtype, lazy)]:
+        assert "m" not in concat([first, second], merge=merge_strategy).varm
+
+
+@pytest.mark.parametrize("axis", ["obs", "var"])
+@pytest.mark.parametrize(
+    ("dtype", "fill_value"),
+    [
+        pytest.param(np.uint8, -1, id="uint8-neg"),
+        pytest.param(np.int8, 1000, id="int8-large"),
+        pytest.param(np.int64, None, id="int-nan"),
+    ],
+)
+def test_concat_outer_dask_fill_value_promotes_dtype(axis, dtype, fill_value):
+    """Outer joins of dask arrays store the fill value exactly, promoting the dtype if needed."""
+    da = pytest.importorskip("dask.array")
+    alt_axis = "var" if axis == "obs" else "obs"
+    a = AnnData(
+        X=da.ones((1, 1), dtype=dtype),
+        obs=pd.DataFrame(index=["s1"]),
+        var=pd.DataFrame(index=["v1"]),
+    )
+    b = AnnData(
+        X=da.ones((1, 1), dtype=dtype),
+        obs=pd.DataFrame(index=["s2" if axis == "obs" else "s1"]),
+        var=pd.DataFrame(index=["v1" if axis == "obs" else "v2"]),
+    )
+    # The second object's other axis has a new name, so the first's values are padded
+    setattr(b, f"{alt_axis}_names", ["new"])
+    result = concat([a, b], axis=axis, join="outer", fill_value=fill_value)
+    assert isinstance(result.X, DaskArray)
+    df = result.to_df()
+    kept = df.loc["s1", "v1"]
+    padded = df.loc["s1", "new"] if axis == "obs" else df.loc["new", "v1"]
+    assert kept == 1
+    if fill_value is None:
+        assert np.isnan(padded)
+    else:
+        assert padded == fill_value

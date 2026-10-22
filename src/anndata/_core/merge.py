@@ -2097,14 +2097,19 @@ def merge(
     merge = resolve_merge_strategy(merge)
     uns_merge = resolve_merge_strategy(uns_merge)
 
-    for pos, a in enumerate(adatas):
-        _check_unique_index(a.obs_names, "obs", pos)
-        _check_unique_index(a.var_names, "var", pos)
+    # `axis_indices` resolves the real names of lazily loaded annotations
+    all_obs_names = [axis_indices(a, axis="obs") for a in adatas]
+    all_var_names = [axis_indices(a, axis="var") for a in adatas]
+    for pos, (a_obs_names, a_var_names) in enumerate(
+        zip(all_obs_names, all_var_names, strict=True)
+    ):
+        _check_unique_index(a_obs_names, "obs", pos)
+        _check_unique_index(a_var_names, "var", pos)
 
-    obs_names = merge_indices([a.obs_names for a in adatas], join=join)
-    var_names = merge_indices([a.var_names for a in adatas], join=join)
-    obs_reindexers = [gen_reindexer(obs_names, a.obs_names) for a in adatas]
-    var_reindexers = [gen_reindexer(var_names, a.var_names) for a in adatas]
+    obs_names = merge_indices(all_obs_names, join=join)
+    var_names = merge_indices(all_var_names, join=join)
+    obs_reindexers = [gen_reindexer(obs_names, names) for names in all_obs_names]
+    var_reindexers = [gen_reindexer(var_names, names) for names in all_var_names]
 
     def merge_mapping(
         attr: str, *, axes: Collection[tuple[Literal["obs", "var"], Literal[0, 1]]]

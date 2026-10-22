@@ -411,15 +411,17 @@ def test_outer_join_dask_fill_dtype(dtype, fill_value, expected_dtype, as_sparse
     merged = ad.merge([a, b], join="outer", fill_value=fill_value)
     assert isinstance(merged.X, da.Array)
     computed = merged.X.compute()
-    if as_sparse and fill_value is None:
-        fill_value = 0
     computed = np.asarray(computed.toarray() if sparse.issparse(computed) else computed)
+    if fill_value is None and as_sparse:
+        # sparse blocks are padded with 0 and keep their dtype
+        assert computed.dtype == dtype
+        assert_equal(computed, np.array([[1, 1], [0, 0]]))
+        return
+    assert computed.dtype == expected_dtype
     if fill_value is None:
-        assert computed.dtype == expected_dtype
         assert_equal(computed, np.array([[1.0, 1.0], [np.nan, np.nan]]))
     else:
         assert_equal(computed, np.array([[1, 1], [fill_value, fill_value]]))
-        assert np.array_equal(computed[1], [fill_value, fill_value])
 
 
 @pytest.mark.parametrize("strategy", ["unique", "same"])
@@ -480,3 +482,29 @@ def test_outer_join_index_order_follows_pandas_union():
     b = _empty(["a"], var.index)
     assert list(ad.merge([a, b], join="outer").obs_names) == ["a", "b", "z"]
     assert list(ad.merge([a, b]).obs_names) == []
+
+
+@pytest.mark.parametrize("load_annotation_index", [True, False])
+def test_lazy_annotations(load_annotation_index):
+    pytest.importorskip("xarray")
+    zarr = pytest.importorskip("zarr")
+    from anndata.experimental import read_lazy
+
+    eager = AnnData(
+        X=np.ones((2, 1)),
+        obs=pd.DataFrame({"score": [10, 20]}, index=["a", "b"]),
+        var=pd.DataFrame({"v": [1]}, index=["x"]),
+    )
+    store = zarr.storage.MemoryStore()
+    eager.write_zarr(store)
+    lazy = read_lazy(store, load_annotation_index=load_annotation_index)
+
+    for merged in (ad.merge([lazy]), ad.merge([eager, lazy]), ad.merge([lazy, eager])):
+        assert list(merged.obs_names) == ["a", "b"]
+        assert list(merged.var_names) == ["x"]
+        assert list(merged.obs["score"]) == [10, 20]
+        assert list(merged.var["v"]) == [1]
+    # positional views of lazy objects
+    merged = ad.merge([eager, lazy[1:]])
+    assert list(merged.obs_names) == ["b"]
+    assert list(merged.obs["score"]) == [20]
