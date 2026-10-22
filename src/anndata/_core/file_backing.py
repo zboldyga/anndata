@@ -162,6 +162,13 @@ def _(x: BaseCompressedSparseDataset, *, copy: bool = False):
     return x.to_memory()
 
 
+def _wrap_block(block: CSMatrix | CSArray) -> np.ndarray:
+    """Wrap a chunk in a 1x1 object array so dask stacks references, not data."""
+    wrapped = np.empty((1, 1), dtype=object)
+    wrapped[0, 0] = block
+    return wrapped
+
+
 def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray:
     """Materialize a dask array of scipy sparse chunks without dask’s final concatenation.
 
@@ -172,18 +179,22 @@ def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray:
     with scipy keeps the parallelism but avoids the extra copies.
     See https://github.com/scverse/anndata/issues/2185
     """
-    import dask
+    import dask.array as da
     from scipy import sparse
 
     if x.ndim != 2:  # pragma: no cover
         msg = f"Expected a 2D sparse dask array, got {x.ndim}D"
         raise ValueError(msg)
     fmt = x._meta.format
-    grid = x.to_delayed()
-    # one scheduler pass computes all blocks in parallel (same as `.compute()`)
-    blocks = np.empty(grid.shape, dtype=object)
-    for i, block in enumerate(dask.compute(*grid.ravel())):
-        blocks.flat[i] = block
+    # A single `compute` keeps the scheduler’s parallelism; dask only has to
+    # assemble a cheap object array of chunk references instead of the data.
+    blocks: np.ndarray = da.map_blocks(
+        _wrap_block,
+        x,
+        chunks=tuple((1,) * n for n in x.numblocks),
+        dtype=object,
+        meta=np.empty((0, 0), dtype=object),
+    ).compute()
     if not all(sparse.issparse(block) for block in blocks.flat):
         # `_meta` was wrong about the chunks; behave like `.compute()` would
         from dask.array.core import concatenate3

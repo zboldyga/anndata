@@ -481,7 +481,7 @@ def test_to_memory_sparse_meta_dense_chunks() -> None:
 
 def test_to_memory_sparse_dask_single_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     """Blockwise materialization computes all chunks in one scheduler pass
-    and bypasses dask’s own concatenation (which copies sparse chunks twice)."""
+    and bypasses dask’s own sparse concatenation (which copies the chunks twice)."""
     import dask
     import dask.array as da
     from dask.array import core as da_core
@@ -493,29 +493,34 @@ def test_to_memory_sparse_dask_single_pass(monkeypatch: pytest.MonkeyPatch) -> N
     )
     x = da.from_array(mat, chunks=(10, 10))
     n_passes = 0
+    n_dask_concats = 0
 
     def counting_get(dsk, keys, **kwargs):
         nonlocal n_passes
         n_passes += 1
         return dask.get(dsk, keys, **kwargs)
 
-    def failing_concatenate3(arrays):
-        msg = "dask’s final concatenation should not be used for sparse chunks"
-        raise AssertionError(msg)
+    dask_concatenate = da_core._concatenate2
 
-    monkeypatch.setattr(da_core, "concatenate3", failing_concatenate3)
+    def counting_concatenate(arrays, axes=None):
+        nonlocal n_dask_concats
+        n_dask_concats += 1
+        return dask_concatenate(arrays, axes)
 
+    monkeypatch.setattr(da_core, "_concatenate2", counting_concatenate)
+
+    # sanity check: plain `.compute()` stacks sparse chunks inside dask
+    with dask.config.set(scheduler=counting_get):
+        assert_equal(x.compute(), mat)
+    assert n_passes == 1
+    assert n_dask_concats > 0
+
+    n_passes = n_dask_concats = 0
     with dask.config.set(scheduler=counting_get):
         result = to_memory(x)
     assert n_passes == 1
+    assert n_dask_concats == 0
     assert_equal(result, mat)
-
-    # dense arrays keep using dask’s concatenation, which fills a preallocated result
-    with (
-        pytest.raises(AssertionError, match="final concatenation"),
-        dask.config.set(scheduler=counting_get),
-    ):
-        to_memory(da.from_array(mat.toarray(), chunks=(10, 10)))
 
 
 SMALL_SHARD_WARNING = r"dask chunk size is less than 100MB"
