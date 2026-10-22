@@ -878,6 +878,11 @@ def test_io_datetime_like(
     partial = read_elem_partial(elem, indices=slice(1, None))
     assert partial.dtype == from_disk.dtype
     assert partial.shape == (len(value) - 1, *value.shape[1:])
+    if isinstance(partial, pd.arrays.DatetimeArray):
+        assert isinstance(from_disk, pd.arrays.DatetimeArray)
+        pd.testing.assert_extension_array_equal(partial, from_disk[1:])
+    else:
+        np.testing.assert_array_equal(partial, from_disk[1:])
     assert read_elem_partial(elem, indices=slice(0, 0)).shape == (0, *value.shape[1:])
     first = read_elem_partial(elem, indices=0)
     expected_first = from_disk[0]
@@ -969,6 +974,19 @@ def test_read_lazy_dataframe_datetime_columns(store: _GroupStorageType) -> None:
             "datetime_tz_cat": pd.Categorical(
                 pd.date_range("2020", periods=2, tz="UTC")
             ),
+            # far future: outside of what `datetime.datetime` (object arrays) can hold
+            "datetime_tz_far_cat": pd.Categorical(
+                pd.array(
+                    np.array(["12000-01-01", "12001-01-01"], dtype="datetime64[s]")
+                ).tz_localize("UTC")
+            ),
+            # all missing, with empty timezone-aware categories
+            "datetime_tz_empty_cat": pd.Categorical(
+                [pd.NaT, pd.NaT],
+                dtype=pd.CategoricalDtype(
+                    pd.DatetimeIndex([], dtype="datetime64[s, UTC]")
+                ),
+            ),
             "timedelta_cat": pd.Categorical(pd.to_timedelta([1, 2], unit="s")),
         },
         index=["a", "b"],
@@ -979,7 +997,10 @@ def test_read_lazy_dataframe_datetime_columns(store: _GroupStorageType) -> None:
     assert isinstance(lazy, Dataset2D)
     assert lazy["datetime"].dtype == df["datetime"].dtype
     assert lazy["timedelta"].dtype == df["timedelta"].dtype
-    pd.testing.assert_frame_equal(lazy.to_memory(), df)
+    in_memory = lazy.to_memory()
+    pd.testing.assert_frame_equal(in_memory, df)
+    for col in df.columns:
+        assert in_memory[col].dtype == df[col].dtype, col
 
 
 @pytest.mark.parametrize(
