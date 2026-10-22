@@ -851,6 +851,7 @@ def test_io_datetime_like(
     first = read_elem_partial(elem, indices=0)
     if tz is not None:
         assert isinstance(first, pd.Timestamp)
+        assert isinstance(value, pd.arrays.DatetimeArray)
         assert first == from_disk[0]
         assert first.unit == value.unit
     else:
