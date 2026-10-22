@@ -241,6 +241,39 @@ def move_to_var(
     return _move_to_annot(adata, keys, axis=0, layer=layer, mapping_key=varm_key)
 
 
+def _mapping_elem_to_array(elem: object, *, where: str) -> np.ndarray:
+    """Convert a dense/sparse/dask/masked `obsm`/`varm` element to a 2-D NumPy array."""
+    if isinstance(elem, AwkArray):
+        msg = (
+            f"{where} is an awkward array, which cannot be moved to X; "
+            "supported sources are DataFrames, dense arrays and sparse matrices."
+        )
+        raise TypeError(msg)
+    if isinstance(elem, DaskArray):
+        elem = (
+            elem.compute()
+        )  # may hold masked chunks, so do this before the check below
+    if isinstance(elem, np.ma.MaskedArray):
+        # keep missingness: masked entries become NaN (upcasting if needed)
+        if elem.dtype.kind not in "biuf":
+            msg = f"{where} must be real numeric or boolean, got dtype {elem.dtype}."
+            raise ValueError(msg)
+        elem = (
+            np.ma.filled(elem.astype(np.float64), np.nan)
+            if np.ma.is_masked(elem)
+            else elem.data
+        )
+    try:
+        arr = asarray(elem)
+    except Exception as e:
+        msg = f"{where} of type {type(elem)} cannot be moved to X."
+        raise TypeError(msg) from e
+    if arr.ndim != 2:
+        msg = f"{where} must be 2-dimensional, got shape {arr.shape}."
+        raise ValueError(msg)
+    return arr
+
+
 def _values_from_mapping(
     adata: AnnData, key: str, *, axis_name: Literal["obs", "var"]
 ) -> tuple[pd.DataFrame, dict[str, object]]:
@@ -256,29 +289,7 @@ def _values_from_mapping(
         if isinstance(df.columns, pd.CategoricalIndex):
             df = df.set_axis(pd.Index(df.columns.astype(object)), axis=1)
     else:
-        if isinstance(elem, AwkArray):
-            msg = (
-                f"`{mapping_name}[{key!r}]` is an awkward array, which cannot be moved to X; "
-                "supported sources are DataFrames, dense arrays and sparse matrices."
-            )
-            raise TypeError(msg)
-        if isinstance(elem, np.ma.MaskedArray):
-            # keep missingness: masked entries become NaN (upcasting if needed)
-            elem = (
-                np.ma.filled(elem.astype(np.float64), np.nan)
-                if np.ma.is_masked(elem)
-                else elem.data
-            )
-        try:
-            arr = asarray(elem)
-        except Exception as e:
-            msg = (
-                f"`{mapping_name}[{key!r}]` of type {type(elem)} cannot be moved to X."
-            )
-            raise TypeError(msg) from e
-        if arr.ndim != 2:
-            msg = f"`{mapping_name}[{key!r}]` must be 2-dimensional, got shape {arr.shape}."
-            raise ValueError(msg)
+        arr = _mapping_elem_to_array(elem, where=f"`{mapping_name}[{key!r}]`")
         df = pd.DataFrame(
             arr,
             index=getattr(adata, f"{axis_name}_names"),
@@ -391,7 +402,8 @@ def move_to_x(
     ``uns`` is kept. ``raw`` is kept when the observation axis is unchanged,
     otherwise it is dropped with a warning.
     Only real numeric and boolean columns can be moved; categorical, string and complex columns raise an error.
-    The object must be in memory (not backed).
+    Masked array sources are converted with masked entries as ``NaN``.
+    The object must be in memory (not backed); like :func:`anndata.concat`, masks on ``X`` or ``layers`` are not preserved.
 
     .. warning::
        APIs in the experimental module are currently in development and subject to change at any time.

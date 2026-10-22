@@ -628,3 +628,20 @@ def test_move_to_x_masked_source(source, dtype):
     res_u = move_to_x(adata, "u", source=source)
     moved_u = asarray(res_u.X)[:, -1] if source == "obsm" else asarray(res_u.X)[-1]
     np.testing.assert_array_equal(moved_u, 1)
+
+
+def test_move_to_x_dask_masked_source():
+    da = pytest.importorskip("dask.array")
+    adata = ad.AnnData(np.zeros((2, 1)))
+    adata.obsm["m"] = da.from_array(
+        np.ma.array([[999.0], [2.0]], mask=[[True], [False]]), chunks=(1, 1)
+    )
+    res = move_to_x(adata, "m", source="obsm")
+    moved = asarray(res.X)[:, -1]
+    assert np.isnan(moved[0])
+    assert moved[1] == 2.0
+    adata.obsm["c"] = np.ma.array(
+        np.ones((2, 1), dtype=complex), mask=[[True], [False]]
+    )
+    with pytest.raises(ValueError, match="must be real numeric or boolean"):
+        move_to_x(adata, "c", source="obsm")
