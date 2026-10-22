@@ -1286,11 +1286,13 @@ def test_resolve_idx_empty_bool_mask(mod: str) -> None:
     old = xp.asarray([False, False, False])
     resolved = ad.experimental.resolve_idx(old, xp.asarray([], dtype=bool), 3)
     assert isinstance(resolved, type(old))
+    assert not isinstance(resolved, slice | int)
     assert resolved.dtype == bool
     assert resolved.shape == (3,)
     assert not np.asarray(resolved).any()
     # whereas an untyped empty sequence is an empty integer index
     resolved = ad.experimental.resolve_idx(old, [], 3)
+    assert not isinstance(resolved, slice | int)
     assert resolved.shape == (0,)
     assert np.issubdtype(np.asarray(resolved).dtype, np.integer)
 
