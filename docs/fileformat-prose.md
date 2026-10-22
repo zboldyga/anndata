@@ -628,9 +628,9 @@ Timezone-aware pandas arrays are converted to UTC before writing and read back a
 
 * Datetime arrays MUST be stored in an Array object with a signed 64-bit integer data type
 * The array's metadata MUST contain the encoding metadata `"encoding-type": "datetime-array"`, `"encoding-version": "0.1.0"`
-* The array's metadata MUST contain a string-valued `"unit"` entry, which is one of the numpy datetime units (`"Y"`, `"M"`, `"W"`, `"D"`, `"h"`, `"m"`, `"s"`, `"ms"`, `"us"`, `"ns"`, `"ps"`, `"fs"`, `"as"`)
+* The array's metadata MUST contain a string-valued `"unit"` entry, which is one of the numpy datetime units (`"Y"`, `"M"`, `"W"`, `"D"`, `"h"`, `"m"`, `"s"`, `"ms"`, `"us"`, `"ns"`, `"ps"`, `"fs"`, `"as"`); numpy's unit-less "generic" datetimes are not supported
 * Each value is the count of `"unit"`s since `1970-01-01T00:00:00` in UTC, with `-9223372036854775808` (the minimum signed 64-bit integer) denoting a missing value
-* The array's metadata MAY contain a string-valued `"tz"` entry naming a timezone (e.g. `"UTC"` or `"Europe/Berlin"`); if absent, the values are timezone-naive
+* The array's metadata MAY contain a string-valued `"tz"` entry naming a timezone, either an IANA key (e.g. `"UTC"` or `"Europe/Berlin"`) or a fixed offset of the form `"UTC±hh:mm"` (e.g. `"UTC+01:00"`); if absent, the values are timezone-naive
 
 (timedelta-array)=
 ### Timedelta array specification (v0.1.0)
@@ -661,7 +661,7 @@ Structured numpy arrays (`np.recarray` or arrays with a structured dtype, as e.g
 
 * Record arrays MUST be stored in an Array object with a compound (HDF5) or structured (zarr) data type
 * The array's metadata MUST contain the encoding metadata `"encoding-type": "rec-array"`, `"encoding-version": "0.2.0"`
-* String fields MUST be stored as variable length utf-8 strings in `HDF5` and as fixed length unicode strings in `zarr`
+* Unicode string fields MUST be stored as variable length utf-8 strings in `HDF5` and as fixed length unicode strings in `zarr`; byte string fields are stored as is
 
 (awkward-array)=
 ## AwkwardArrays

@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from functools import partial, singledispatch
 from pathlib import Path
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, cast, overload
 
 import h5py
 import numpy as np
@@ -14,8 +14,9 @@ from scipy import sparse
 import anndata as ad
 from anndata._core.file_backing import filename, get_elem_name
 from anndata._core.xarray import Dataset2D, requires_xarray
-from anndata.compat import DaskArray, XDataset, XVariable, pandas_as_str
+from anndata.compat import DaskArray, XDataset, XVariable, _read_attr, pandas_as_str
 
+from ...utils import warn
 from .registry import _LAZY_REGISTRY, IOSpec, read_elem
 
 if TYPE_CHECKING:
@@ -298,6 +299,36 @@ def _read_index(elem: StorageType) -> pd.Index:
     values = read_elem(elem)
     assert isinstance(values, np.ndarray | pd.api.extensions.ExtensionArray)
     return pd.Index(values)
+
+
+def _read_datetime_like(
+    elem: h5py.Dataset | zarr.Array,
+    *,
+    _reader: LazyReader,
+    chunks: tuple[int | None, ...] | None = None,
+    kind: Literal["M", "m"],
+) -> DaskArray:
+    """Read the int64 counts lazily and view them as datetime64/timedelta64 of the stored unit."""
+    read_counts = read_h5_array if isinstance(elem, h5py.Dataset) else read_zarr_array
+    counts = cast("DaskArray", read_counts(elem, _reader=_reader, chunks=chunks))
+    unit = _read_attr(elem.attrs, "unit")
+    if (tz := _read_attr(elem.attrs, "tz", default=None)) is not None:
+        msg = (
+            f"Lazily read datetime array {elem.name!r} has timezone {tz!r}, "
+            "which dask arrays cannot represent; the values are returned as timezone-naive UTC."
+        )
+        warn(msg, UserWarning)
+    # `astype` converts a big-endian dataset to native byte order (and is a no-op otherwise)
+    return counts.astype(np.int64).view(f"{kind}8[{unit}]")
+
+
+for _array_type in (h5py.Dataset, zarr.Array):
+    _LAZY_REGISTRY.register_read(_array_type, IOSpec("datetime-array", "0.1.0"))(
+        partial(_read_datetime_like, kind="M")
+    )
+    _LAZY_REGISTRY.register_read(_array_type, IOSpec("timedelta-array", "0.1.0"))(
+        partial(_read_datetime_like, kind="m")
+    )
 
 
 @_LAZY_REGISTRY.register_read(zarr.Group, IOSpec("dataframe", "0.2.0"))

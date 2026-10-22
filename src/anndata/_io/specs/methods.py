@@ -5,11 +5,13 @@ import warnings
 from collections.abc import Mapping, MutableMapping
 from contextlib import contextmanager, nullcontext
 from copy import copy
+from datetime import timedelta, timezone
 from functools import partial, wraps
 from importlib.metadata import version
 from itertools import product
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
+from zoneinfo import ZoneInfo
 
 import h5py
 import numpy as np
@@ -1446,37 +1448,64 @@ def _write_datetime_like(
         msg = f"Writing zero-dimensional {elem.dtype} arrays is not supported."
         raise NotImplementedError(msg)
     unit, step = np.datetime_data(elem.dtype)
-    if step != 1:
+    if step != 1 or unit == "generic":
         msg = (
             f"Cannot write {elem.dtype} array: "
-            f"only unit steps are supported, got step {step}."
+            "only datetime-like dtypes with an explicit unit and a unit step are supported."
         )
         raise ValueError(msg)
-    write_basic(
-        f,
-        k,
-        np.asarray(elem).view(np.int64),
-        _writer=_writer,
-        dataset_kwargs=dataset_kwargs,
-    )
+    dataset_kwargs = dict(dataset_kwargs)
+    if (dtype := dataset_kwargs.pop("dtype", None)) is not None and np.dtype(
+        dtype
+    ) != np.dtype(np.int64):
+        msg = f"Datetime-like arrays are stored as int64 counts, got dtype={dtype!r} in dataset_kwargs."
+        raise ValueError(msg)
+    # Convert to native byte order (a no-op copy-free cast for native input) before viewing
+    counts = np.asarray(elem, dtype=elem.dtype.newbyteorder("=")).view(np.int64)
+    write_basic(f, k, counts, _writer=_writer, dataset_kwargs=dataset_kwargs)
     f[k].attrs["unit"] = unit
 
 
-def _read_datetime_like(elem: _ArrayStorageType, kind: Literal["M", "m"]) -> np.ndarray:
+def _counts_to_datetime_like(
+    elem: _ArrayStorageType, counts: npt.ArrayLike, kind: Literal["M", "m"]
+) -> np.ndarray:
     unit = _read_attr(elem.attrs, "unit")
-    return np.asarray(elem[()]).view(f"{kind}8[{unit}]")
+    # Convert to native byte order before viewing, in case the dataset was stored big-endian
+    return np.asarray(counts).astype(np.int64, copy=False).view(f"{kind}8[{unit}]")
+
+
+def _read_datetime_like(elem: _ArrayStorageType, kind: Literal["M", "m"]) -> np.ndarray:
+    return _counts_to_datetime_like(elem, elem[()], kind)
 
 
 def _read_datetime_like_partial(
     elem: _ArrayStorageType, kind: Literal["M", "m"], indices
 ) -> np.ndarray:
-    unit = _read_attr(elem.attrs, "unit")
-    return np.asarray(elem[indices]).view(f"{kind}8[{unit}]")
+    counts = elem.oindex[indices] if isinstance(elem, zarr.Array) else elem[indices]
+    return _counts_to_datetime_like(elem, counts, kind)
 
 
 def _tz_to_str(tz: tzinfo) -> str:
-    """Serialize a timezone so that pandas can reconstruct it (e.g. `"Europe/Berlin"`)."""
-    tz_str = str(tz)
+    """\
+    Serialize a timezone so that pandas reconstructs one with the same semantics.
+
+    IANA zones (`zoneinfo`, `pytz`) are stored by key, fixed offsets as `"UTC±hh:mm"`.
+    """
+    if isinstance(tz, ZoneInfo):
+        tz_str = tz.key
+    elif isinstance(tz, timezone):
+        # `str(tz)` would return the name, which pandas may resolve to a DST observing IANA zone
+        offset = tz.utcoffset(None)
+        assert offset is not None
+        sign = "-" if offset < timedelta(0) else "+"
+        hours, rem = divmod(abs(offset), timedelta(hours=1))
+        minutes, rem = divmod(rem, timedelta(minutes=1))
+        if rem:
+            msg = f"Cannot write datetime array with sub-minute timezone offset {tz!r}."
+            raise ValueError(msg)
+        tz_str = "UTC" if not offset else f"UTC{sign}{hours:02d}:{minutes:02d}"
+    else:  # e.g. pytz
+        tz_str = getattr(tz, "zone", None) or str(tz)
     try:
         pd.DatetimeTZDtype(tz=tz_str)
     except (KeyError, TypeError, ValueError) as e:
@@ -1489,11 +1518,15 @@ def _tz_to_str(tz: tzinfo) -> str:
     return tz_str
 
 
-def _localize_datetime_array(elem: _ArrayStorageType, values: np.ndarray):
+def _localize_datetime_array(
+    elem: _ArrayStorageType, values: np.ndarray
+) -> np.ndarray | pd.arrays.DatetimeArray | pd.Timestamp:
     tz = _read_attr(elem.attrs, "tz", default=None)
     if tz is None:
         return values
     # Stored values are UTC based, so localizing to UTC is unambiguous
+    if values.ndim == 0:
+        return pd.Timestamp(values.item()).tz_localize("UTC").tz_convert(tz)
     return pd.array(values).tz_localize("UTC").tz_convert(tz)
 
 
@@ -1547,7 +1580,7 @@ def write_pandas_timedelta_array(
 @_REGISTRY.register_read(zarr.Array, _DATETIME_SPEC)
 def read_datetime_array(
     elem: _ArrayStorageType, *, _reader: Reader
-) -> np.ndarray | pd.arrays.DatetimeArray:
+) -> np.ndarray | pd.arrays.DatetimeArray | pd.Timestamp:
     return _localize_datetime_array(elem, _read_datetime_like(elem, "M"))
 
 
