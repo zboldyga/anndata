@@ -14,7 +14,7 @@ from pandas.api.types import is_bool_dtype, is_complex_dtype, is_numeric_dtype
 from .._core.anndata import AnnData
 from .._core.merge import _resolve_axis, concat
 from .._warnings import warn
-from ..compat import AwkArray, DaskArray
+from ..compat import AwkArray, CSArray, CSMatrix, DaskArray
 from ..utils import asarray
 
 if TYPE_CHECKING:
@@ -77,6 +77,64 @@ def _resolve_axis_mask(
     return names.isin(names_list), names_list
 
 
+def _reject_masked_values(elem: object, *, where: str) -> None:
+    """Reject masks before pandas or concat can expose the backing values."""
+    if isinstance(elem, DaskArray):
+        from dask.array import map_blocks
+
+        has_mask = map_blocks(np.ma.getmaskarray, elem, dtype=bool).any().compute()
+    else:
+        has_mask = np.ma.is_masked(elem)
+    if has_mask:
+        msg = f"{where} contains masked values, which cannot be moved safely."
+        raise ValueError(msg)
+
+
+def _check_masks(adata: AnnData) -> None:
+    """Check arrays that will be copied, subset, or concatenated."""
+    _reject_masked_values(adata.X, where="`X`")
+    for attr in ("layers", "obsm", "varm", "obsp", "varp"):
+        for key, elem in getattr(adata, attr).items():
+            _reject_masked_values(elem, where=f"`{attr}[{key!r}]`")
+    if adata.raw is not None:
+        _reject_masked_values(adata.raw.X, where="`raw.X`")
+        for key, elem in adata.raw.varm.items():
+            _reject_masked_values(elem, where=f"`raw.varm[{key!r}]`")
+
+
+def _integer_precision_loss(values) -> np.ndarray:
+    """Return one boolean per block, checking only stored entries for sparse blocks."""
+    arr = values.data if isinstance(values, CSArray | CSMatrix) else asarray(values)
+    loss = any(int(value) != int(float(value)) for value in arr.flat)
+    return np.full((1,) * values.ndim, loss, dtype=bool)
+
+
+def _check_integer_precision(values, *, where: str) -> None:
+    """Check with Python integers: NumPy comparisons can themselves round integers."""
+    if values.dtype.kind not in "iu":
+        return
+    if isinstance(values, DaskArray):
+        from dask.array import map_blocks
+
+        loss = (
+            map_blocks(
+                _integer_precision_loss,
+                values,
+                dtype=bool,
+                chunks=(1,) * values.ndim,
+            )
+            .any()
+            .compute()
+        )
+    else:
+        loss = _integer_precision_loss(values).any()
+    if loss:
+        msg = (
+            f"{where} contains integers that cannot be represented exactly as float64."
+        )
+        raise ValueError(msg)
+
+
 def _move_to_annot(
     adata: AnnData,
     keys: str | Collection[str] | NDArray[np.bool_],
@@ -89,6 +147,7 @@ def _move_to_annot(
 
     `axis` is the axis that shrinks, i.e. the axis the moved entries are taken from.
     """
+    _check_masks(adata)
     mask, moved = _resolve_axis_mask(adata, keys, axis=axis)
     if layer is None and not adata._has_X():
         msg = "X is None, there are no values to move. Pass `layer` to move values from a layer."
@@ -168,7 +227,10 @@ def move_to_obs(
     Returns
     -------
     A new :class:`~anndata.AnnData` with ``n_vars`` reduced by the number of moved variables.
-    The object must be in memory (not backed); like :func:`anndata.concat`, masks on ``X`` or ``layers`` are not preserved.
+    The object must be in memory (not backed). Arrays containing masked values are rejected,
+    including ``X``, ``layers`` and axis mappings, to avoid exposing their backing values.
+    Masks already discarded by :func:`anndata.concat` or :meth:`~anndata.AnnData.to_df`
+    before calling this function cannot be detected or recovered.
 
     See Also
     --------
@@ -231,7 +293,10 @@ def move_to_var(
     Returns
     -------
     A new :class:`~anndata.AnnData` with ``n_obs`` reduced by the number of moved observations.
-    The object must be in memory (not backed); like :func:`anndata.concat`, masks on ``X`` or ``layers`` are not preserved.
+    The object must be in memory (not backed). Arrays containing masked values are rejected,
+    including ``X``, ``layers`` and axis mappings, to avoid exposing their backing values.
+    Masks already discarded by :func:`anndata.concat` or :meth:`~anndata.AnnData.to_df`
+    before calling this function cannot be detected or recovered.
     If ``adata.raw`` is set, it is subset along with ``X``.
 
     See Also
@@ -253,16 +318,9 @@ def _mapping_elem_to_array(elem: object, *, where: str) -> np.ndarray:
         elem = (
             elem.compute()
         )  # may hold masked chunks, so do this before the check below
+    _reject_masked_values(elem, where=where)
     if isinstance(elem, np.ma.MaskedArray):
-        # keep missingness: masked entries become NaN (upcasting if needed)
-        if elem.dtype.kind not in "biuf":
-            msg = f"{where} must be real numeric or boolean, got dtype {elem.dtype}."
-            raise ValueError(msg)
-        elem = (
-            np.ma.filled(elem.astype(np.float64), np.nan)
-            if np.ma.is_masked(elem)
-            else elem.data
-        )
+        elem = elem.data
     try:
         arr = asarray(elem)
     except Exception as e:
@@ -311,6 +369,7 @@ def _to_numeric_array(df: pd.DataFrame, where: str) -> np.ndarray:
     """Convert numeric/boolean columns to one 2-D array using NumPy's type promotion.
 
     Nullable extension dtypes are materialized with `NaN` for missing values.
+    Integer values must be exactly representable when promoted to float64.
     """
     if bad := [
         c
@@ -328,6 +387,10 @@ def _to_numeric_array(df: pd.DataFrame, where: str) -> np.ndarray:
         if (numpy_dtype := getattr(col.dtype, "numpy_dtype", None)) is not None:
             # nullable extension dtypes (Int64, Float64, boolean)
             if col.isna().any():
+                _check_integer_precision(
+                    col.dropna().to_numpy(dtype=numpy_dtype),
+                    where=f"{where} column {name!r}",
+                )
                 arr = col.to_numpy(dtype=np.float64, na_value=np.nan)
             else:
                 arr = col.to_numpy(dtype=numpy_dtype)
@@ -338,6 +401,9 @@ def _to_numeric_array(df: pd.DataFrame, where: str) -> np.ndarray:
     if dtype.kind not in "biuf":
         msg = f"Values of {where} cannot be combined into a numeric array (got dtype {dtype})."
         raise ValueError(msg)
+    if dtype.kind == "f":
+        for name, arr in zip(df.columns, columns, strict=True):
+            _check_integer_precision(arr, where=f"{where} column {name!r}")
     return np.column_stack([c.astype(dtype, copy=False) for c in columns]).reshape(
         len(df), len(columns)
     )
@@ -402,8 +468,15 @@ def move_to_x(
     ``uns`` is kept. ``raw`` is kept when the observation axis is unchanged,
     otherwise it is dropped with a warning.
     Only real numeric and boolean columns can be moved; categorical, string and complex columns raise an error.
-    Masked array sources are converted with masked entries as ``NaN``.
-    The object must be in memory (not backed); like :func:`anndata.concat`, masks on ``X`` or ``layers`` are not preserved.
+    Nullable integer columns with missing values use ``float64`` and ``NaN``;
+    integer source values (including existing ``X``) that cannot be represented exactly
+    as ``float64`` are rejected when conversion to floating or complex values is needed.
+    Sparse and Dask mapping sources are materialized as dense NumPy arrays.
+    Dask arrays are evaluated to check for masks and lossy integer conversions.
+    The object must be in memory (not backed). Arrays containing masked values are rejected,
+    including ``X``, ``layers`` and axis mappings, to avoid exposing their backing values.
+    Masks already discarded by :func:`anndata.concat` or :meth:`~anndata.AnnData.to_df`
+    before calling this function cannot be detected or recovered.
 
     .. warning::
        APIs in the experimental module are currently in development and subject to change at any time.
@@ -438,6 +511,7 @@ def move_to_x(
     )
     aligned_axis = 1 - grow_axis
 
+    _check_masks(adata)
     # Work on a copy so nothing in the result shares memory with the input.
     src = adata.copy()
     aligned_names: pd.Index = getattr(src, f"{aligned_axis_name}_names")
@@ -448,6 +522,13 @@ def move_to_x(
         )
     values, rest_annot, rest_mapping, where = _resolve_source(src, keys, source=source)
     new_values = _to_numeric_array(values, where)
+    if (
+        src._has_X()
+        and np.result_type(getattr(src.X, "dtype", None), new_values.dtype).kind in "fc"
+    ):
+        _check_integer_precision(src.X, where="`X`")
+        for i, name in enumerate(values.columns):
+            _check_integer_precision(new_values[:, i], where=f"{where} column {name!r}")
 
     grow_names: pd.Index = getattr(src, f"{grow_axis_name}_names")
     if collisions := [c for c in values.columns if c in grow_names]:

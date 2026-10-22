@@ -343,6 +343,63 @@ def test_move_to_x_nullable_dtypes():
     assert np.isnan(col.iloc[1])
 
 
+@pytest.mark.parametrize("source", ["obs", "var", "obsm", "varm"])
+@pytest.mark.parametrize("value", [2**53, 2**53 + 1, 2**53 + 2])
+@pytest.mark.parametrize("missing", [True, False], ids=["NA", "no-NA"])
+@pytest.mark.parametrize("dtype", ["Int64", "UInt64"])
+@pytest.mark.parametrize("x_dtype", [np.int64, np.float64])
+def test_move_to_x_nullable_integer_precision(
+    source, value, dtype, x_dtype, *, missing: bool
+):
+    adata = ad.AnnData(np.zeros((2, 2), dtype=x_dtype))
+    values = pd.array([value, None if missing else 1], dtype=dtype)
+    if source in {"obs", "var"}:
+        getattr(adata, source)["large"] = values
+    else:
+        getattr(adata, source)["large"] = pd.DataFrame(
+            {"large": values},
+            index=adata.obs_names if source == "obsm" else adata.var_names,
+        )
+    # int64 + uint64 also promotes to float64, even without missing values.
+    needs_float = missing or x_dtype is np.float64 or dtype == "UInt64"
+    if needs_float and value == 2**53 + 1:
+        with pytest.raises(
+            ValueError, match=r"large.*cannot be represented exactly as float64"
+        ):
+            move_to_x(adata, "large", source=source)
+    else:
+        res = move_to_x(adata, "large", source=source)
+        moved = res.X[:, -1] if source.startswith("obs") else res.X[-1]
+        # Compare Python integers: NumPy's float/int equality can hide rounding.
+        assert int(moved[0]) == value
+        if missing:
+            assert np.isnan(moved[1])
+        else:
+            assert moved[1] == 1
+
+
+@pytest.mark.parametrize(
+    "value", [-(2**53 + 1), np.iinfo(np.int64).max, np.iinfo(np.uint64).max]
+)
+def test_move_to_x_nullable_integer_extremes(value):
+    dtype = "UInt64" if value > np.iinfo(np.int64).max else "Int64"
+    adata = ad.AnnData(
+        obs=pd.DataFrame({"large": pd.array([value, None], dtype=dtype)})
+    )
+    with pytest.raises(
+        ValueError, match=r"large.*cannot be represented exactly as float64"
+    ):
+        move_to_x(adata, "large")
+
+
+def test_move_to_x_mixed_integer_float_columns_precision():
+    adata = ad.AnnData(obs=pd.DataFrame({"large": [2**53 + 1], "float": [1.0]}))
+    with pytest.raises(
+        ValueError, match=r"large.*cannot be represented exactly as float64"
+    ):
+        move_to_x(adata, ["large", "float"])
+
+
 def test_move_to_x_errors():
     adata = gen_adata((5, 4), obsm_types=(), varm_types=())
     with pytest.raises(KeyError, match="Columns \\['nope'\\] not found in `obs`"):
@@ -610,38 +667,153 @@ def test_move_to_x_awkward_source_rejected():
 
 
 @pytest.mark.parametrize("source", ["obsm", "varm"])
-@pytest.mark.parametrize("dtype", [float, int], ids=["float", "int"])
-def test_move_to_x_masked_source(source, dtype):
-    adata = gen_adata((3, 2), obsm_types=(), varm_types=())
-    n = adata.n_obs if source == "obsm" else adata.n_vars
-    masked = np.ma.array(
-        np.full((n, 1), 999, dtype=dtype),
-        mask=np.array([[True], *([[False]] * (n - 1))]),
-    )
-    getattr(adata, source)["m"] = masked
-    res = move_to_x(adata, "m", source=source)
-    moved = asarray(res.X)[:, -1] if source == "obsm" else asarray(res.X)[-1]
-    assert np.isnan(moved[0])
-    np.testing.assert_array_equal(moved[1:], 999)
-    # an unmasked masked array keeps its dtype
-    getattr(adata, source)["u"] = np.ma.array(np.ones((n, 1), dtype=dtype))
-    res_u = move_to_x(adata, "u", source=source)
-    moved_u = asarray(res_u.X)[:, -1] if source == "obsm" else asarray(res_u.X)[-1]
-    np.testing.assert_array_equal(moved_u, 1)
+@pytest.mark.parametrize("value", [2**53, 2**53 + 1])
+@pytest.mark.parametrize("masked", [True, False], ids=["masked", "unmasked"])
+@pytest.mark.parametrize("dask", [True, False], ids=["dask", "numpy"])
+def test_move_to_x_masked_integer_source(source, value, *, masked: bool, dask: bool):
+    adata = ad.AnnData(np.zeros((2, 2), dtype=np.int64))
+    values = np.ma.array([[value], [1]], mask=[[False], [masked]])
+    if dask:
+        da = pytest.importorskip("dask.array")
+        values = da.from_array(values, chunks=(1, 1))
+    getattr(adata, source)["m"] = values
+    if masked:
+        with pytest.raises(ValueError, match=rf"{source}\['m'\].*masked values"):
+            move_to_x(adata, "m", source=source)
+    else:
+        res = move_to_x(adata, "m", source=source)
+        moved = asarray(res.X)[:, -1] if source == "obsm" else asarray(res.X)[-1]
+        assert moved.dtype == np.int64
+        assert int(moved[0]) == value
 
 
-def test_move_to_x_dask_masked_source():
-    da = pytest.importorskip("dask.array")
+@pytest.mark.parametrize("dtype", [float, complex])
+def test_move_to_x_masked_source_dtype(dtype):
     adata = ad.AnnData(np.zeros((2, 1)))
-    adata.obsm["m"] = da.from_array(
-        np.ma.array([[999.0], [2.0]], mask=[[True], [False]]), chunks=(1, 1)
+    adata.obsm["m"] = np.ma.array(np.ones((2, 1), dtype=dtype), mask=[[True], [False]])
+    with pytest.raises(ValueError, match=r"obsm\['m'\].*masked values"):
+        move_to_x(adata, "m", source="obsm")
+    if dtype is complex:
+        adata.obsm["m"] = np.ma.array(np.ones((2, 1), dtype=dtype))
+        with pytest.raises(ValueError, match="Only real numeric or boolean"):
+            move_to_x(adata, "m", source="obsm")
+
+
+@pytest.mark.parametrize("func", [move_to_obs, move_to_var, move_to_x])
+@pytest.mark.parametrize(
+    "location", ["X", "layers", "obsm", "varm", "obsp", "varp", "raw.X", "raw.varm"]
+)
+@pytest.mark.parametrize("dask", [False, True], ids=["numpy", "dask"])
+def test_move_rejects_masks_before_conversion(func, location, *, dask: bool):
+    adata = ad.AnnData(np.ones((2, 2)))
+    adata.obs["a"] = [1, 2]
+    values = np.ma.array([[999, 2], [3, 4]], mask=[[True, False], [False, False]])
+    if dask:
+        da = pytest.importorskip("dask.array")
+        values = da.from_array(values, chunks=(1, 2))
+    if location.startswith("raw."):
+        raw = adata.copy()
+        if location == "raw.X":
+            raw.X = values
+        else:
+            raw.varm["masked"] = values
+        adata.raw = raw
+    elif location == "X":
+        adata.X = values
+    else:
+        getattr(adata, location)["masked"] = values
+    key = "a" if func is move_to_x else "0"
+    original = (values.compute() if dask else values).copy()
+    with pytest.raises(ValueError, match="contains masked values") as exc:
+        func(adata, key)
+    assert location in str(exc.value)
+    if location not in {"X", "raw.X"}:
+        assert "'masked'" in str(exc.value)
+    actual = values.compute() if dask else values
+    np.testing.assert_array_equal(actual.data, original.data)
+    np.testing.assert_array_equal(actual.mask, original.mask)
+
+
+@pytest.mark.parametrize("func", [move_to_obs, move_to_var])
+@pytest.mark.parametrize("masked", [True, False], ids=["masked", "unmasked"])
+def test_move_to_annot_masked_layer(func, *, masked: bool):
+    adata = ad.AnnData(np.ones((2, 2)))
+    adata.layers["counts"] = np.ma.array(
+        [[999, 2], [3, 4]], mask=[[masked, False], [False, False]]
     )
-    res = move_to_x(adata, "m", source="obsm")
-    moved = asarray(res.X)[:, -1]
-    assert np.isnan(moved[0])
-    assert moved[1] == 2.0
-    adata.obsm["c"] = np.ma.array(
-        np.ones((2, 1), dtype=complex), mask=[[True], [False]]
+    if masked:
+        with pytest.raises(ValueError, match=r"layers\['counts'\].*masked values"):
+            func(adata, "0", layer="counts")
+    else:
+        res = func(adata, "0", layer="counts")
+        moved = res.obs["0"] if func is move_to_obs else res.var["0"]
+        np.testing.assert_array_equal(
+            moved, [999, 3] if func is move_to_obs else [999, 2]
+        )
+
+
+@pytest.mark.parametrize("func", [move_to_obs, move_to_var, move_to_x])
+@pytest.mark.parametrize("location", ["X", "layers", "obsm", "varm", "obsp", "varp"])
+def test_move_rejects_dask_masks_without_masked_metadata(func, location):
+    from dask import delayed
+
+    da = pytest.importorskip("dask.array")
+    masked = np.ma.array(
+        [[999.0, 2.0], [3.0, 4.0]], mask=[[True, False], [False, False]]
     )
-    with pytest.raises(ValueError, match="must be real numeric or boolean"):
-        move_to_x(adata, "c", source="obsm")
+    values = da.from_delayed(delayed(lambda: masked)(), shape=(2, 2), dtype=float)
+    assert not isinstance(values._meta, np.ma.MaskedArray)
+    adata = ad.AnnData(np.ones((2, 2)))
+    adata.obs["a"] = [1, 2]
+    if location == "X":
+        adata.X = values
+    else:
+        getattr(adata, location)["masked"] = values
+    with pytest.raises(ValueError, match="contains masked values") as exc:
+        func(adata, "a" if func is move_to_x else "0")
+    assert location in str(exc.value)
+
+
+@pytest.mark.parametrize("source", ["obs", "var", "obsm", "varm"])
+@pytest.mark.parametrize("value", [2**53, 2**53 + 1, 2**53 + 2])
+def test_move_to_x_integer_source_complex_x(source, value):
+    adata = ad.AnnData(np.zeros((2, 2), dtype=np.complex128))
+    values = np.array([value, 1], dtype=np.int64)
+    getattr(adata, source)["large"] = (
+        values[:, None] if source.endswith("m") else values
+    )
+    if value == 2**53 + 1:
+        with pytest.raises(
+            ValueError, match="cannot be represented exactly as float64"
+        ):
+            move_to_x(adata, "large", source=source)
+    else:
+        res = move_to_x(adata, "large", source=source)
+        moved = res.X[:, -1] if source.startswith("obs") else res.X[-1]
+        assert int(moved[0].real) == value
+
+
+@pytest.mark.parametrize("source", ["obs", "var"])
+@pytest.mark.parametrize("value", [2**53, 2**53 + 1, 2**53 + 2])
+def test_move_to_x_existing_integer_precision(matrix_type, source, value):
+    adata = ad.AnnData(matrix_type(np.array([[value, 1], [2, 3]], dtype=np.int64)))
+    getattr(adata, source)["score"] = [1.0, 2.0]
+    if value == 2**53 + 1:
+        with pytest.raises(
+            ValueError, match=r"`X`.*cannot be represented exactly as float64"
+        ):
+            move_to_x(adata, "score", source=source)
+    else:
+        res = move_to_x(adata, "score", source=source)
+        assert int(asarray(res.X)[0, 0]) == value
+
+
+def test_move_to_x_existing_dask_sparse_integer_precision():
+    da = pytest.importorskip("dask.array")
+    x = sparse.csr_matrix(np.array([[2**53 + 1, 1], [2, 3]], dtype=np.int64))
+    adata = ad.AnnData(da.from_array(x, chunks=(1, 1)))
+    adata.obs["score"] = [1.0, 2.0]
+    with pytest.raises(
+        ValueError, match=r"`X`.*cannot be represented exactly as float64"
+    ):
+        move_to_x(adata, "score")
