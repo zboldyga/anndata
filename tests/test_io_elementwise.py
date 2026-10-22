@@ -974,19 +974,6 @@ def test_read_lazy_dataframe_datetime_columns(store: _GroupStorageType) -> None:
             "datetime_tz_cat": pd.Categorical(
                 pd.date_range("2020", periods=2, tz="UTC")
             ),
-            # far future: outside of what `datetime.datetime` (object arrays) can hold
-            "datetime_tz_far_cat": pd.Categorical(
-                pd.array(
-                    np.array(["12000-01-01", "12001-01-01"], dtype="datetime64[s]")
-                ).tz_localize("UTC")
-            ),
-            # all missing, with empty timezone-aware categories
-            "datetime_tz_empty_cat": pd.Categorical(
-                [pd.NaT, pd.NaT],
-                dtype=pd.CategoricalDtype(
-                    pd.DatetimeIndex([], dtype="datetime64[s, UTC]")
-                ),
-            ),
             "timedelta_cat": pd.Categorical(pd.to_timedelta([1, 2], unit="s")),
         },
         index=["a", "b"],
@@ -997,10 +984,38 @@ def test_read_lazy_dataframe_datetime_columns(store: _GroupStorageType) -> None:
     assert isinstance(lazy, Dataset2D)
     assert lazy["datetime"].dtype == df["datetime"].dtype
     assert lazy["timedelta"].dtype == df["timedelta"].dtype
+    pd.testing.assert_frame_equal(lazy.to_memory(), df)
+
+
+@pytest.mark.parametrize("empty_categories", [False, True], ids=["far_future", "empty"])
+def test_read_lazy_datetime_categorical(
+    store: _GroupStorageType, *, empty_categories: bool
+) -> None:
+    """Decoding categories must preserve extension dtypes, even outside Python's date range."""
+    pytest.importorskip("xarray")
+    dates = [] if empty_categories else ["12000-01-01", "12001-01-01"]
+    categories = pd.DatetimeIndex(np.array(dates, dtype="datetime64[s]"), tz="UTC")
+    codes = [-1, -1, -1] if empty_categories else [1, -1, 0]
+    df = pd.DataFrame(
+        {
+            "dates": pd.Categorical.from_codes(
+                codes, dtype=pd.CategoricalDtype(categories, ordered=True)
+            )
+        },
+        index=["a", "b", "c"],
+    )
+    write_elem(store, "df", df)
+    eager = read_elem(store["df"])
+    assert isinstance(eager, pd.DataFrame)
+    pd.testing.assert_frame_equal(eager, df)
+
+    lazy = read_elem_lazy(store["df"])
+    assert isinstance(lazy, Dataset2D)
     in_memory = lazy.to_memory()
     pd.testing.assert_frame_equal(in_memory, df)
-    for col in df.columns:
-        assert in_memory[col].dtype == df[col].dtype, col
+    # Empty categories must still support `.dt`; dates beyond year 9999 must not wrap.
+    assert in_memory["dates"].dt.tz == categories.tz
+    pd.testing.assert_series_equal(in_memory["dates"].dt.year, df["dates"].dt.year)
 
 
 @pytest.mark.parametrize(
