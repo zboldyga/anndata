@@ -593,6 +593,76 @@ Therefore an R implementation SHOULD write a `character` array with `"na-value":
 and when reading a `"nullable-string-array"`, it MAY choose to read it into a `character` array,
 ignoring the `"na-value"` attribute (since `character` arrays can not be made to behave with `"NaN"` semantics).
 
+(datetime-arrays)=
+## Datetime and timedelta arrays
+
+Neither HDF5 nor the zarr core specification has a portable representation of datetimes,
+so `anndata` stores datetime-like arrays as their integer counts and records the unit (and, for timezone-aware pandas arrays, the timezone) in the metadata.
+This keeps the representation identical in `h5ad` and `zarr` files.
+The integer representation follows numpy: a count of the given unit since the Unix epoch for datetimes, with `NaT` encoded as the minimum signed 64-bit integer.
+
+```python
+>>> import numpy as np, pandas as pd
+>>> from anndata.io import write_elem, read_elem
+>>> datetimes = pd.date_range("2018-01-01", periods=3, freq="h")
+>>> write_elem(store, "datetimes", datetimes.to_numpy())
+>>> store["datetimes"]
+<HDF5 dataset "datetimes": shape (3,), type "<i8">
+>>> dict(store["datetimes"].attrs)
+{'encoding-type': 'datetime-array', 'encoding-version': '0.1.0', 'unit': 'us'}
+>>> read_elem(store["datetimes"])
+array(['2018-01-01T00:00:00.000000', '2018-01-01T01:00:00.000000',
+       '2018-01-01T02:00:00.000000'], dtype='datetime64[us]')
+```
+
+Timezone-aware pandas arrays are converted to UTC before writing and read back as timezone-aware {class}`pandas.arrays.DatetimeArray`\ s:
+
+```python
+>>> write_elem(store, "datetimes_tz", pd.array(datetimes.tz_localize("Europe/Berlin")))
+>>> dict(store["datetimes_tz"].attrs)
+{'encoding-type': 'datetime-array', 'encoding-version': '0.1.0', 'tz': 'Europe/Berlin', 'unit': 'us'}
+```
+
+(datetime-array)=
+### Datetime array specification (v0.1.0)
+
+* Datetime arrays MUST be stored in an Array object with a signed 64-bit integer data type
+* The array's metadata MUST contain the encoding metadata `"encoding-type": "datetime-array"`, `"encoding-version": "0.1.0"`
+* The array's metadata MUST contain a string-valued `"unit"` entry, which is one of the numpy datetime units (`"Y"`, `"M"`, `"W"`, `"D"`, `"h"`, `"m"`, `"s"`, `"ms"`, `"us"`, `"ns"`, `"ps"`, `"fs"`, `"as"`)
+* Each value is the count of `"unit"`s since `1970-01-01T00:00:00` in UTC, with `-9223372036854775808` (the minimum signed 64-bit integer) denoting a missing value
+* The array's metadata MAY contain a string-valued `"tz"` entry naming a timezone (e.g. `"UTC"` or `"Europe/Berlin"`); if absent, the values are timezone-naive
+
+(timedelta-array)=
+### Timedelta array specification (v0.1.0)
+
+* Timedelta arrays MUST be stored in an Array object with a signed 64-bit integer data type
+* The array's metadata MUST contain the encoding metadata `"encoding-type": "timedelta-array"`, `"encoding-version": "0.1.0"`
+* The array's metadata MUST contain a string-valued `"unit"` entry, as for [datetime arrays](#datetime-array)
+* Each value is a duration counted in `"unit"`s, with `-9223372036854775808` denoting a missing value
+
+(record-arrays)=
+## Record arrays
+
+Structured numpy arrays (`np.recarray` or arrays with a structured dtype, as e.g. produced by scanpy's `rank_genes_groups`) are stored using the native compound (HDF5) or structured (zarr) data types.
+
+```python
+>>> rec_array = np.rec.fromarrays(
+...     [np.array(["a", "b"]), np.array([1.0, 2.0])], names=["gene", "score"]
+... )
+>>> write_elem(store, "rec_array", rec_array)
+>>> store["rec_array"]
+<HDF5 dataset "rec_array": shape (2,), type "|V16">
+>>> dict(store["rec_array"].attrs)
+{'encoding-type': 'rec-array', 'encoding-version': '0.2.0'}
+```
+
+(rec-array)=
+### Record array specification (v0.2.0)
+
+* Record arrays MUST be stored in an Array object with a compound (HDF5) or structured (zarr) data type
+* The array's metadata MUST contain the encoding metadata `"encoding-type": "rec-array"`, `"encoding-version": "0.2.0"`
+* String fields MUST be stored as variable length utf-8 strings in `HDF5` and as fixed length unicode strings in `zarr`
+
 (awkward-array)=
 ## AwkwardArrays
 

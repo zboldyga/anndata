@@ -821,6 +821,29 @@ def test_write_string_types(diskfmt_store, roundtrip):
     assert_equal(adata, from_disk)
 
 
+def test_write_datetime_columns(diskfmt_store, roundtrip):
+    # https://github.com/scverse/anndata/issues/2238
+    adata = ad.AnnData(
+        obs=pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(["2018-01-01", "NaT", "2018-01-03"]),
+                "datetime_tz": pd.date_range("2018", periods=3, freq="h", tz="UTC"),
+                "timedelta": pd.to_timedelta([1, None, 3], unit="s"),
+                "datetime_cat": pd.Categorical(
+                    pd.to_datetime(["2018", "2019", "2018"])
+                ),
+            },
+            index=["a", "b", "c"],
+        ),
+    )
+
+    from_disk = roundtrip(adata, diskfmt_store)
+
+    assert_equal(adata, from_disk)
+    pd.testing.assert_frame_equal(from_disk.obs, adata.obs)
+    assert from_disk.obs["datetime_tz"].dtype == adata.obs["datetime_tz"].dtype
+
+
 @pytest.mark.skipif(not find_spec("scanpy"), reason="Scanpy is not installed")
 def test_scanpy_pbmc68k(roundtrip, roundtrip2, diskfmt_store, diskfmt2_store):
     import scanpy as sc

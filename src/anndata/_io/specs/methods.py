@@ -54,6 +54,7 @@ from .registry import _REGISTRY, IOSpec, read_elem, read_elem_partial
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator
+    from datetime import tzinfo
     from os import PathLike
     from typing import Any, Literal
 
@@ -1418,6 +1419,156 @@ def _read_nullable_string(
     )
     arr[mask] = pd.NA
     return arr
+
+
+#############
+# Datetimes #
+#############
+
+# `datetime64`/`timedelta64` have no native representation in HDF5 and only a
+# zarr-specific one in zarr, so we store the integer counts plus the unit as an
+# attribute. This keeps the on-disk representation identical for both stores.
+# See https://github.com/scverse/anndata/issues/2238
+
+_DATETIME_SPEC = IOSpec("datetime-array", "0.1.0")
+_TIMEDELTA_SPEC = IOSpec("timedelta-array", "0.1.0")
+
+
+def _write_datetime_like(
+    f: _GroupStorageType,
+    k: str,
+    elem: np.ndarray,
+    *,
+    _writer: Writer,
+    dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
+) -> None:
+    if elem.ndim == 0:
+        msg = f"Writing zero-dimensional {elem.dtype} arrays is not supported."
+        raise NotImplementedError(msg)
+    unit, step = np.datetime_data(elem.dtype)
+    if step != 1:
+        msg = (
+            f"Cannot write {elem.dtype} array: "
+            f"only unit steps are supported, got step {step}."
+        )
+        raise ValueError(msg)
+    write_basic(
+        f,
+        k,
+        np.asarray(elem).view(np.int64),
+        _writer=_writer,
+        dataset_kwargs=dataset_kwargs,
+    )
+    f[k].attrs["unit"] = unit
+
+
+def _read_datetime_like(elem: _ArrayStorageType, kind: Literal["M", "m"]) -> np.ndarray:
+    unit = _read_attr(elem.attrs, "unit")
+    return np.asarray(elem[()]).view(f"{kind}8[{unit}]")
+
+
+def _read_datetime_like_partial(
+    elem: _ArrayStorageType, kind: Literal["M", "m"], indices
+) -> np.ndarray:
+    unit = _read_attr(elem.attrs, "unit")
+    return np.asarray(elem[indices]).view(f"{kind}8[{unit}]")
+
+
+def _tz_to_str(tz: tzinfo) -> str:
+    """Serialize a timezone so that pandas can reconstruct it (e.g. `"Europe/Berlin"`)."""
+    tz_str = str(tz)
+    try:
+        pd.DatetimeTZDtype(tz=tz_str)
+    except (KeyError, TypeError, ValueError) as e:
+        msg = (
+            f"Cannot write datetime array with timezone {tz!r}: "
+            f"its string form {tz_str!r} is not a timezone pandas can parse. "
+            "Convert it to an IANA timezone first, e.g. `.tz_convert('UTC')`."
+        )
+        raise ValueError(msg) from e
+    return tz_str
+
+
+def _localize_datetime_array(elem: _ArrayStorageType, values: np.ndarray):
+    tz = _read_attr(elem.attrs, "tz", default=None)
+    if tz is None:
+        return values
+    # Stored values are UTC based, so localizing to UTC is unambiguous
+    return pd.array(values).tz_localize("UTC").tz_convert(tz)
+
+
+for _store_type in _STORE_TYPES:
+    for _array_type in (np.ndarray, views.ArrayView):
+        _REGISTRY.register_write(_store_type, (_array_type, "M"), _DATETIME_SPEC)(
+            _write_datetime_like
+        )
+        _REGISTRY.register_write(_store_type, (_array_type, "m"), _TIMEDELTA_SPEC)(
+            _write_datetime_like
+        )
+
+
+@_REGISTRY.register_write(h5py.Group, pd.arrays.DatetimeArray, _DATETIME_SPEC)
+@_REGISTRY.register_write(zarr.Group, pd.arrays.DatetimeArray, _DATETIME_SPEC)
+def write_pandas_datetime_array(
+    f: _GroupStorageType,
+    k: str,
+    elem: pd.arrays.DatetimeArray,
+    *,
+    _writer: Writer,
+    dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
+) -> None:
+    tz_str = None if elem.tz is None else _tz_to_str(elem.tz)
+    if tz_str is not None:
+        # Store UTC based counts, so reading back is independent of DST ambiguity
+        elem = elem.tz_convert("UTC").tz_localize(None)
+    _write_datetime_like(
+        f, k, elem.to_numpy(), _writer=_writer, dataset_kwargs=dataset_kwargs
+    )
+    if tz_str is not None:
+        f[k].attrs["tz"] = tz_str
+
+
+@_REGISTRY.register_write(h5py.Group, pd.arrays.TimedeltaArray, _TIMEDELTA_SPEC)
+@_REGISTRY.register_write(zarr.Group, pd.arrays.TimedeltaArray, _TIMEDELTA_SPEC)
+def write_pandas_timedelta_array(
+    f: _GroupStorageType,
+    k: str,
+    elem: pd.arrays.TimedeltaArray,
+    *,
+    _writer: Writer,
+    dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
+) -> None:
+    _write_datetime_like(
+        f, k, elem.to_numpy(), _writer=_writer, dataset_kwargs=dataset_kwargs
+    )
+
+
+@_REGISTRY.register_read(h5py.Dataset, _DATETIME_SPEC)
+@_REGISTRY.register_read(zarr.Array, _DATETIME_SPEC)
+def read_datetime_array(
+    elem: _ArrayStorageType, *, _reader: Reader
+) -> np.ndarray | pd.arrays.DatetimeArray:
+    return _localize_datetime_array(elem, _read_datetime_like(elem, "M"))
+
+
+@_REGISTRY.register_read_partial(h5py.Dataset, _DATETIME_SPEC)
+@_REGISTRY.register_read_partial(zarr.Array, _DATETIME_SPEC)
+def read_datetime_array_partial(elem, *, items=None, indices=(slice(None, None))):
+    return _localize_datetime_array(
+        elem, _read_datetime_like_partial(elem, "M", indices)
+    )
+
+
+@_REGISTRY.register_read(h5py.Dataset, _TIMEDELTA_SPEC)
+@_REGISTRY.register_read(zarr.Array, _TIMEDELTA_SPEC)
+def read_timedelta_array(elem: _ArrayStorageType, *, _reader: Reader) -> np.ndarray:
+    return _read_datetime_like(elem, "m")
+
+
+@_REGISTRY.register_read_partial(h5py.Dataset, _TIMEDELTA_SPEC)
+@_REGISTRY.register_read_partial(zarr.Array, _TIMEDELTA_SPEC)
+def read_timedelta_array_partial(elem, *, items=None, indices=(slice(None, None))):
+    return _read_datetime_like_partial(elem, "m", indices)
 
 
 ###########

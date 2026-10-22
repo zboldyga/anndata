@@ -4,6 +4,7 @@ Tests that each element in an anndata is written correctly
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 from contextlib import ExitStack, nullcontext
 from importlib.metadata import version
@@ -21,7 +22,7 @@ from zarr.storage import MemoryStore
 
 import anndata as ad
 from anndata._io.specs import _REGISTRY, IOSpec, get_spec
-from anndata._io.specs.registry import IORegistryError
+from anndata._io.specs.registry import IORegistryError, read_elem_partial
 from anndata.compat import CSArray, CSMatrix, DaskArray, _read_attr
 from anndata.experimental import read_elem_lazy
 from anndata.io import read_elem, write_elem
@@ -173,6 +174,26 @@ def create_sparse_store[G: h5py.Group | zarr.Group](
         ),
         pytest.param(
             pd.Categorical([1, 2, 1, 3], ordered=True), "categorical", id="pd_cat_num"
+        ),
+        pytest.param(
+            pd.Categorical(np.repeat(pd.date_range("2018", periods=3, freq="YE"), 2)),
+            "categorical",
+            id="pd_cat_datetime",
+        ),
+        pytest.param(
+            pd.date_range("2018-01-01", periods=5, freq="h").to_numpy(),
+            "datetime-array",
+            id="np_arr_datetime",
+        ),
+        pytest.param(
+            pd.to_timedelta(np.arange(5), unit="s").to_numpy(),
+            "timedelta-array",
+            id="np_arr_timedelta",
+        ),
+        pytest.param(
+            pd.array(pd.date_range("2018-01-01", periods=5, freq="h", tz="UTC")),
+            "datetime-array",
+            id="pd_arr_datetime_tz",
         ),
         pytest.param(
             pd.array(["hello", "world"], dtype="string"),
@@ -675,6 +696,146 @@ def test_write_io_error(store, obj):
 
     msg = str(exc_info.value)
     assert re.search(full_pattern, msg)
+
+
+@pytest.mark.parametrize(
+    ("value", "encoding_type", "attrs"),
+    [
+        pytest.param(
+            np.array(["2020-01-01", "NaT", "1969-12-31"], dtype="datetime64[D]"),
+            "datetime-array",
+            {"unit": "D"},
+            id="np_datetime_nat",
+        ),
+        pytest.param(
+            np.array(["2020-01-01T00:00:00.123456789", "NaT"], dtype="datetime64[ns]"),
+            "datetime-array",
+            {"unit": "ns"},
+            id="np_datetime_ns",
+        ),
+        pytest.param(
+            pd.date_range("2018", periods=6, freq="h").to_numpy().reshape(3, 2),
+            "datetime-array",
+            {"unit": "us"},
+            id="np_datetime_2d",
+        ),
+        pytest.param(
+            np.array([1, -2, "NaT"], dtype="timedelta64[ms]"),
+            "timedelta-array",
+            {"unit": "ms"},
+            id="np_timedelta_nat",
+        ),
+        pytest.param(
+            pd.array(pd.to_datetime(["2018-01-01", "NaT", "2018-01-03"])),
+            "datetime-array",
+            {"unit": "us"},
+            id="pd_datetime_nat",
+        ),
+        pytest.param(
+            pd.array(
+                pd.date_range("2018-03-25", periods=5, freq="h", tz="Europe/Berlin")
+            ),
+            "datetime-array",
+            {"unit": "us", "tz": "Europe/Berlin"},
+            id="pd_datetime_tz_dst",
+        ),
+        pytest.param(
+            pd.array(pd.to_timedelta([1, None, 3], unit="s")),
+            "timedelta-array",
+            {"unit": "s"},
+            id="pd_timedelta_nat",
+        ),
+    ],
+)
+def test_io_datetime_like(
+    store: _GroupStorageType,
+    value: np.ndarray | pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray,
+    encoding_type: str,
+    attrs: dict[str, str],
+) -> None:
+    """Datetime-like arrays round-trip (incl. NaT) with the same layout in both stores."""
+    key = f"key_for_{encoding_type}"
+    write_elem(store, key, value)
+
+    elem = store[key]
+    assert isinstance(elem, h5py.Dataset | zarr.Array)
+    assert _read_attr(elem.attrs, "encoding-type") == encoding_type
+    assert all(_read_attr(elem.attrs, k) == v for k, v in attrs.items())
+    # On disk, the counts are stored as plain integers
+    assert np.dtype(elem.dtype) == np.dtype(np.int64)
+
+    from_disk = read_elem(elem)
+    if isinstance(value, pd.arrays.DatetimeArray) and value.tz is not None:
+        assert isinstance(from_disk, pd.arrays.DatetimeArray)
+        assert from_disk.dtype == value.dtype
+        assert str(from_disk.tz) == str(value.tz)
+        pd.testing.assert_extension_array_equal(from_disk, value)
+    else:
+        assert isinstance(from_disk, np.ndarray)
+        assert from_disk.dtype == np.asarray(value).dtype
+        np.testing.assert_array_equal(from_disk, np.asarray(value))
+
+    # Partial reads keep the dtype as well
+    partial = read_elem_partial(store[key], indices=slice(1, None))
+    assert partial.dtype == from_disk.dtype
+    assert len(partial) == len(value) - 1
+
+
+@pytest.mark.parametrize(
+    ("value", "exc", "pattern"),
+    [
+        pytest.param(
+            np.array([1, 2], dtype="datetime64[25s]"),
+            ValueError,
+            r"only unit steps are supported, got step 25",
+            id="non_unit_step",
+        ),
+        pytest.param(
+            np.array(np.datetime64("2020-01-01", "s")),
+            NotImplementedError,
+            r"zero-dimensional datetime64\[s\] arrays",
+            id="zero_dim",
+        ),
+    ],
+)
+def test_write_datetime_like_errors(
+    store: _GroupStorageType, value: np.ndarray, exc: type[Exception], pattern: str
+) -> None:
+    with pytest.raises(exc, match=pattern):
+        write_elem(store, "key", value)
+    assert "key" not in store
+
+
+class _UnnamedTz(dt.tzinfo):
+    """A timezone whose string form pandas cannot parse (like `dateutil.tz.tzutc()`)."""
+
+    def utcoffset(self, _: dt.datetime | None) -> dt.timedelta:
+        return dt.timedelta(hours=1)
+
+    def dst(self, _: dt.datetime | None) -> dt.timedelta:
+        return dt.timedelta(0)
+
+    def tzname(self, _: dt.datetime | None) -> str:
+        return "unnamed"
+
+
+def test_write_datetime_unparseable_tz(store: _GroupStorageType) -> None:
+    value = pd.array(pd.date_range("2018", periods=3, freq="h", tz=_UnnamedTz()))
+    assert value.tz is not None
+    with pytest.raises(ValueError, match=r"timezone.*_UnnamedTz.*tz_convert"):
+        write_elem(store, "key", value)
+    assert "key" not in store
+
+
+def test_read_native_zarr_datetime_array() -> None:
+    """Zarr arrays written as native datetimes with the `array` encoding (anndata < 0.14) stay readable."""
+    value = pd.date_range("2018-01-01", periods=5, freq="h").to_numpy()
+    group = zarr.open_group(MemoryStore(), mode="w")
+    arr = group.create_array("key", shape=value.shape, dtype=value.dtype)
+    arr[...] = value
+    arr.attrs.update({"encoding-type": "array", "encoding-version": "0.2.0"})
+
+    np.testing.assert_array_equal(read_elem(group["key"]), value)
 
 
 PAT_IMPLICIT = r"allow_write_nullable_strings.*None.*future\.infer_string.*False"
