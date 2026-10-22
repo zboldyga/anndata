@@ -169,23 +169,19 @@ def _wrap_block(block: CSMatrix | CSArray) -> np.ndarray:
     return wrapped
 
 
-def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray:
-    """Materialize a dask array of scipy sparse chunks without dask’s final concatenation.
+def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray | np.ndarray:
+    """Materialize a 2D dask array of scipy sparse chunks without dask’s final concatenation.
 
     :meth:`dask.array.Array.compute` concatenates the computed chunks with
-    :func:`~scipy.sparse.hstack` per block row and then :func:`~scipy.sparse.vstack`,
-    which copies the data twice and keeps all intermediates alive at once.
+    :func:`~scipy.sparse.hstack` per block row and then :func:`~scipy.sparse.vstack`
+    even when an axis has a single block, copying the data more often than needed.
     Computing the chunks in one scheduler pass and stacking them directly
-    with scipy keeps the parallelism but avoids the extra copies.
+    with scipy keeps the parallelism but avoids these extra copies.
     See https://github.com/scverse/anndata/issues/2185
     """
     import dask.array as da
     from scipy import sparse
 
-    if x.ndim != 2:  # pragma: no cover
-        msg = f"Expected a 2D sparse dask array, got {x.ndim}D"
-        raise ValueError(msg)
-    fmt = x._meta.format
     # A single `compute` keeps the scheduler’s parallelism; dask only has to
     # assemble a cheap object array of chunk references instead of the data.
     blocks: np.ndarray = da.map_blocks(
@@ -195,24 +191,23 @@ def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray:
         dtype=object,
         meta=np.empty((0, 0), dtype=object),
     ).compute()
-    if not all(sparse.issparse(block) for block in blocks.flat):
+    if not all(isinstance(block, CSMatrix | CSArray) for block in blocks.flat):
         # `_meta` was wrong about the chunks; behave like `.compute()` would
         from dask.array.core import concatenate3
 
         return concatenate3(blocks.tolist())
     n_block_rows, n_block_cols = blocks.shape
-    if n_block_cols == 1:
-        rows = list(blocks[:, 0])
-    else:
-        rows = [sparse.hstack(list(row), format=fmt) for row in blocks]
-    if n_block_rows == 1 and isinstance(rows[0], CSMatrix | CSArray):
-        return rows[0].asformat(fmt)
-    return sparse.vstack(rows, format=fmt)
+    if n_block_rows == n_block_cols == 1:
+        # like dask, don’t hand out the chunk itself (it might be persisted)
+        return blocks[0, 0].copy()
+    # scipy’s stacking keeps the format when the chunks agree, like dask does
+    rows = [row[0] if n_block_cols == 1 else sparse.hstack(list(row)) for row in blocks]
+    return rows[0] if n_block_rows == 1 else sparse.vstack(rows)
 
 
 @to_memory.register(DaskArray)
 def _(x: DaskArray, *, copy: bool = False):
-    if isinstance(x._meta, CSMatrix | CSArray):
+    if x.ndim == 2 and isinstance(x._meta, CSMatrix | CSArray):
         return _compute_sparse_blockwise(x)
     return x.compute()
 

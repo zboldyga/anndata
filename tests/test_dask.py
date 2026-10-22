@@ -454,11 +454,76 @@ def test_to_memory_sparse_dask_blockwise(
 
     result = to_memory(x)
 
-    assert isinstance(result, sparse_type)
+    computed = x.compute()
+    assert type(result) is type(computed) is sparse_type
     assert result.format == mat.format
     assert result.shape == mat.shape
+    assert result.indices.dtype == computed.indices.dtype
+    assert result.indptr.dtype == computed.indptr.dtype
+    assert result.has_canonical_format == computed.has_canonical_format
     assert_equal(result, mat)
-    assert_equal(result, x.compute())
+    assert_equal(result, computed)
+
+
+@pytest.mark.parametrize("copy", [True, False], ids=["copy", "no_copy"])
+@pytest.mark.parametrize("persist", [True, False], ids=["persisted", "lazy"])
+def test_to_memory_sparse_dask_single_chunk_no_alias(
+    *, copy: bool, persist: bool
+) -> None:
+    """A single-chunk result must not alias the chunk held by the dask graph."""
+    import dask.array as da
+
+    x = da.from_array(sparse.csr_matrix(np.eye(3)), chunks=-1)
+    if persist:
+        x = x.persist()
+
+    result = ad.AnnData(x).to_memory(copy=copy)
+    result.X.data[:] = 99
+
+    np.testing.assert_array_equal(x.compute().toarray(), np.eye(3))
+
+
+def test_to_memory_sparse_dask_1d_uns() -> None:
+    """1D sparse dask arrays (e.g. in `uns`) still go through `.compute()`."""
+    import dask.array as da
+
+    x = da.from_array(sparse.csr_array([1, 0, 2]), chunks=-1)
+    adata = ad.AnnData(np.zeros((2, 2)), uns={"sparse_1d": x})
+
+    result = adata.to_memory()
+
+    assert isinstance(result.uns["sparse_1d"], sparse.csr_array)
+    np.testing.assert_array_equal(result.uns["sparse_1d"].toarray(), [1, 0, 2])
+
+
+def test_to_memory_sparse_dask_anndata_elements() -> None:
+    """Sparse dask arrays in X, layers, obsm, varm and raw are all materialized."""
+    import dask.array as da
+
+    rng = np.random.default_rng(0)
+    mat = sparse.random(30, 20, density=0.3, format="csr", random_state=rng)
+    obsm = sparse.random(30, 7, density=0.3, format="csc", random_state=rng)
+    adata = ad.AnnData(
+        X=da.from_array(mat, chunks=(10, -1)),
+        layers={"csc_grid": da.from_array(sparse.csc_array(mat), chunks=(10, 6))},
+        obsm={"sparse": da.from_array(obsm, chunks=(-1, 3))},
+    )
+    adata.raw = adata
+
+    mem = adata.to_memory()
+
+    for lazy, loaded in [
+        (adata.X, mem.X),
+        (adata.layers["csc_grid"], mem.layers["csc_grid"]),
+        (adata.obsm["sparse"], mem.obsm["sparse"]),
+        (adata.raw.X, mem.raw.X),
+    ]:
+        assert isinstance(lazy, DaskArray)
+        computed = lazy.compute()
+        assert type(loaded) is type(computed)
+        assert loaded.format == computed.format
+        assert loaded.indices.dtype == computed.indices.dtype
+        assert_equal(loaded, computed)
 
 
 def test_to_memory_sparse_meta_dense_chunks() -> None:

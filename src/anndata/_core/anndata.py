@@ -1428,9 +1428,10 @@ class AnnData:  # noqa: PLW1641
     def to_memory(self, *, copy: bool = False) -> AnnData:
         """Return a new AnnData object with all non-in-memory arrays loaded into memory.
 
-        Dask arrays with sparse chunks are materialized block by block and stacked
-        with :mod:`scipy.sparse`, which needs less peak memory than
-        :meth:`dask.array.Array.compute`.
+        Dask arrays with :mod:`scipy.sparse` CSR/CSC chunks are materialized block by
+        block and stacked with :mod:`scipy.sparse`, which can need less peak memory
+        than :meth:`dask.array.Array.compute`. With a distributed scheduler, the
+        chunks are stacked on the client instead of on a worker.
 
         Params
         ------
