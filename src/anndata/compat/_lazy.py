@@ -23,6 +23,7 @@ Placeholders cannot be subclassed; use `factory=` to lazily build a real subclas
 from __future__ import annotations
 
 import sys
+import threading
 from abc import ABCMeta
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -35,6 +36,8 @@ __all__ = ["LazyType", "lazy_type", "lazy_type_for"]
 
 _LAZY_TYPES: list[LazyType] = []
 _REAL_TO_LAZY: dict[type, LazyType] = {}
+# guards first resolution (factories must run exactly once); reentrant for nested factories
+_RESOLVE_LOCK = threading.RLock()
 
 
 class LazyType(ABCMeta):
@@ -72,12 +75,18 @@ class LazyType(ABCMeta):
                 return None
         elif (mod := sys.modules.get(cls._lazy_module)) is None:
             return None
-        if cls._lazy_factory is not None:
-            real = cls._lazy_factory()
-        elif (real := getattr(mod, cls._lazy_name, None)) is None:
-            return None  # e.g. the module is still being initialized
-        cls._lazy_real = real
-        _REAL_TO_LAZY[real] = cls
+        with _RESOLVE_LOCK:
+            if (real := cls._lazy_real) is not None:  # resolved by another thread
+                return real
+            if cls._lazy_factory is not None:
+                real = cls._lazy_factory()
+            elif (real := getattr(mod, cls._lazy_name, None)) is None:
+                return None  # e.g. the module is still being initialized
+            cls._lazy_real = real
+            _REAL_TO_LAZY[real] = cls
+            # Registering as a virtual subclass bumps the ABC cache token,
+            # which invalidates negative `isinstance` caches and `singledispatch` caches.
+            ABCMeta.register(cls, real)
         if cls._lazy_on_resolve is not None:
             cls._lazy_on_resolve(real)
         return real
@@ -89,6 +98,15 @@ class LazyType(ABCMeta):
             raise ImportError(msg)
         return real
 
+    def __instancecheck__(cls, instance: object) -> bool:
+        # resolve first: ABCMeta’s negative cache would otherwise skip `__subclasshook__`
+        cls._lazy_get()
+        return super().__instancecheck__(instance)
+
+    def __subclasscheck__(cls, subclass: type) -> bool:
+        cls._lazy_get()
+        return super().__subclasscheck__(subclass)
+
     def __call__(cls, *args: object, **kwargs: object) -> object:
         return cls._lazy_require()(*args, **kwargs)
 
@@ -97,6 +115,10 @@ class LazyType(ABCMeta):
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(cls._lazy_require(), name)
+
+    def __getitem__(cls, item: object) -> object:
+        """Forward `__class_getitem__` (e.g. `XDataset[int]`) to the real class."""
+        return cls._lazy_require().__class_getitem__(item)  # type: ignore[attr-defined]
 
     def __repr__(cls) -> str:
         return f"<lazy class '{cls.__module__}.{cls.__qualname__}'>"

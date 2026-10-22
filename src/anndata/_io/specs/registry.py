@@ -42,6 +42,20 @@ if TYPE_CHECKING:
     )
 
 
+def _normalize_src_type(src_type: WriteSrcType) -> WriteSrcType:
+    """Replace real classes of optional dependencies by their `anndata.compat` placeholders.
+
+    Write specs are keyed by those placeholders, so registrations and lookups
+    with the real class (e.g. `dask.array.Array`) must map onto the same key.
+    """
+    if isinstance(src_type, tuple):
+        return cast(
+            "WriteSrcType",
+            tuple(lazy_type_for(t) if isinstance(t, type) else t for t in src_type),
+        )
+    return lazy_type_for(src_type)
+
+
 def to_writeable(x):
     # Convert non-numpy array-API arrays to numpy via DLPack. Array-API arrays
     # that cannot export via DLPack (e.g. pydata/sparse) are left as-is so the
@@ -130,6 +144,7 @@ class IORegistry[RI: (_ReadInternal, _ReadLazyInternal), R: (Read, ReadLazy)]:
     ) -> Callable[[W], W]:
         spec = proc_spec(spec)
         modifiers = frozenset(modifiers)
+        src_type = _normalize_src_type(src_type)
 
         # Record specification for src_type
         if src_type in self.write_specs and (spec != self.write_specs[src_type]):
@@ -161,6 +176,7 @@ class IORegistry[RI: (_ReadInternal, _ReadLazyInternal), R: (Read, ReadLazy)]:
 
         if dest_type is h5py.File:
             dest_type = h5py.Group
+        src_type = _normalize_src_type(src_type)
         if (dest_type, src_type, modifiers) not in self.write:
             raise IORegistryError._from_write_parts(dest_type, src_type, modifiers)
         internal = self.write[(dest_type, src_type, modifiers)]
@@ -172,7 +188,7 @@ class IORegistry[RI: (_ReadInternal, _ReadLazyInternal), R: (Read, ReadLazy)]:
         src_type: WriteSrcType,
         modifiers: frozenset[str],
     ) -> bool:
-        return (dest_type, src_type, modifiers) in self.write
+        return (dest_type, _normalize_src_type(src_type), modifiers) in self.write
 
     def register_read(
         self,

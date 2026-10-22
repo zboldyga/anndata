@@ -4,7 +4,7 @@ from codecs import decode
 from collections.abc import Mapping
 from contextlib import nullcontext
 from enum import Enum, auto
-from functools import partial, singledispatch
+from functools import cache, partial, singledispatch
 from importlib import import_module
 from importlib.metadata import version
 from typing import TYPE_CHECKING, Protocol, cast, overload
@@ -181,10 +181,13 @@ else:
     XBackendArray = lazy_type("xarray.backends", "BackendArray")
     XZarrArrayWrapper = lazy_type("xarray.backends.zarr", "ZarrArrayWrapper")
 
-    def _register_cupy_dask_chunk_types(_: type) -> None:
+    @cache
+    def _register_cupy_dask_chunk_types(_: type | None = None) -> None:
         """Allow dask arrays with cupy sparse chunks.
 
-        Runs once, when anndata first encounters a cupy object, as it needs cupy and dask.
+        Runs once, when anndata first resolves a cupy placeholder
+        (i.e. once cupy is imported and anndata checks an object against a cupy type),
+        and imports dask if it is installed.
         """
         try:
             import dask.array as da

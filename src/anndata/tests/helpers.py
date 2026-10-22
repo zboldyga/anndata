@@ -322,6 +322,11 @@ def maybe_add_sparse_array[M: MutableMapping[str, Any]](
 
 
 # TODO: Use hypothesis for this?
+def _lazy_types(*types: type) -> set[type]:
+    """Map real optional types (e.g. `dask.array.Array`) to their placeholders."""
+    return {lazy_type_for(t) for t in types}
+
+
 def gen_adata(  # noqa: PLR0913
     shape: tuple[int, int],
     X_type: Callable[[np.ndarray], object] | None = sparse.csr_matrix,
@@ -417,7 +422,11 @@ def gen_adata(  # noqa: PLR0913
         varm["xdataset"] = XDataset.from_dataframe(
             gen_typed_df(N, var_names, dtypes=var_dtypes)
         )
-    obsm = {k: v for k, v in obsm.items() if lazy_type_for(type(v)) in obsm_types}
+    obsm = {
+        k: v
+        for k, v in obsm.items()
+        if lazy_type_for(type(v)) in _lazy_types(*obsm_types)
+    }
     obsm = maybe_add_sparse_array(
         mapping=obsm,
         types=obsm_types,
@@ -425,7 +434,11 @@ def gen_adata(  # noqa: PLR0913
         random_state=random_state,
         shape=(M, 100),
     )
-    varm = {k: v for k, v in varm.items() if lazy_type_for(type(v)) in varm_types}
+    varm = {
+        k: v
+        for k, v in varm.items()
+        if lazy_type_for(type(v)) in _lazy_types(*varm_types)
+    }
     varm = maybe_add_sparse_array(
         mapping=varm,
         types=varm_types,
@@ -445,7 +458,11 @@ def gen_adata(  # noqa: PLR0913
         random_state=random_state,
         shape=(M, N),
     )
-    layers = {k: v for k, v in layers.items() if lazy_type_for(type(v)) in layers_types}
+    layers = {
+        k: v
+        for k, v in layers.items()
+        if lazy_type_for(type(v)) in _lazy_types(*layers_types)
+    }
     obsp = dict(
         array=xp.asarray(random_state.random((M, M))),
         sparse=sparse.random(M, M, format=sparse_fmt, random_state=random_state),
@@ -651,8 +668,8 @@ def assert_equal_array_api(
     elem_name: str | None = None,
 ) -> None:
     if isinstance(a, CupyArray):
-        # `CupyArray` is a lazy placeholder, which `singledispatch` cannot rank
-        # against this protocol, so dispatch manually.
+        # If cupy arrays satisfy this protocol, `singledispatch` prefers it over the
+        # lazy `CupyArray` placeholder registered below, so dispatch manually.
         assert_equal_cupy(a, b, exact=exact, elem_name=elem_name)
     elif not np.isscalar(a):
         xp = a.__array_namespace__()
@@ -670,6 +687,7 @@ def assert_equal_array_api(
         assert a == b
 
 
+@assert_equal.register(CupyArray)
 def assert_equal_cupy(
     a: CupyArray, b: object, *, exact: bool = False, elem_name: str | None = None
 ):

@@ -1701,8 +1701,6 @@ def concat(  # noqa: PLR0912, PLR0913, PLR0915
     {'a': 1, 'b': 2, 'c': {'c.a': 3, 'c.b': 4, 'c.c': 5}}
     """
 
-    import xarray as xr
-
     from anndata._core.xarray import Dataset2D
 
     # Argument normalization
@@ -1815,6 +1813,8 @@ def concat(  # noqa: PLR0912, PLR0913, PLR0915
             a.ds.rename({a.true_index_dim: DS_MERGE_DUMMY_INDEX_NAME})
             for a in annotations_with_only_dask
         ]
+        import xarray as xr
+
         alt_annot = Dataset2D(xr.merge(datasets_to_merge, join=join, compat="override"))
 
     if join == "inner":
