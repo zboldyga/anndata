@@ -189,9 +189,9 @@ def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray:
         rows = list(blocks[:, 0])
     else:
         rows = [sparse.hstack(list(row), format=fmt) for row in blocks]
-    if n_block_rows > 1 or not sparse.issparse(rows[0]):
-        return sparse.vstack(rows, format=fmt)
-    return rows[0].asformat(fmt)
+    if n_block_rows == 1 and isinstance(rows[0], CSMatrix | CSArray):
+        return rows[0].asformat(fmt)
+    return sparse.vstack(rows, format=fmt)
 
 
 @to_memory.register(DaskArray)
