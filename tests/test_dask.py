@@ -455,24 +455,28 @@ def test_to_memory_sparse_dask_blockwise(
             *shape, density=0.3, format="csr", random_state=np.random.default_rng(0)
         )
     )
-    if not canonical:  # wide index dtype, unsorted and duplicate indices
-        coo = mat.tocoo()
+    if not canonical and mat.nnz:  # wide index dtype, unsorted and duplicate entries
+        # duplicate the first two stored entries of each compressed row/column
+        starts, ends = mat.indptr[:-1], mat.indptr[1:]
+        pieces_data, pieces_indices, nnz_per_row = [], [], []
+        for start, end in zip(starts, ends, strict=True):
+            dup = min(end - start, 2)
+            pieces_data.append(mat.data[start:end])
+            pieces_data.append(mat.data[start : start + dup])
+            pieces_indices.append(mat.indices[start:end])
+            pieces_indices.append(mat.indices[start : start + dup])
+            nnz_per_row.append(end - start + dup)
+        indptr = np.concatenate([[0], np.cumsum(nnz_per_row)]).astype(np.int64)
         mat = sparse_type(
             (
-                np.concatenate([coo.data, coo.data[:2]]),
-                (
-                    np.concatenate([coo.row, coo.row[:2]]).astype(np.int64),
-                    np.concatenate([coo.col, coo.col[:2]]).astype(np.int64),
-                ),
+                np.concatenate(pieces_data),
+                np.concatenate(pieces_indices).astype(np.int64),
+                indptr,
             ),
             shape=shape,
         )
-        mat.indices, mat.indptr = (
-            mat.indices.astype(np.int64),
-            mat.indptr.astype(np.int64),
-        )
-        mat.indices[-2:] = mat.indices[-2:][::-1]
-        mat.has_sorted_indices = False
+        assert not mat.has_canonical_format
+        assert mat.nnz > len(np.unique(mat.tocoo().coords, axis=1)[0])
     x = da.from_array(mat, chunks=chunks)
 
     result = to_memory(x)
@@ -652,7 +656,7 @@ def test_to_memory_sparse_dask_single_pass(monkeypatch: pytest.MonkeyPatch) -> N
     # every chunk is requested from the scheduler directly:
     # no finalize task that would gather all chunks on one worker
     chunk_keys = {(x.name, i, j) for i in range(6) for j in range(2)}
-    assert set(requested_keys) == chunk_keys
+    assert set(dask.core.flatten(requested_keys)) == chunk_keys
     assert_equal(result, mat)
 
 
