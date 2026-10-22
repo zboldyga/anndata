@@ -162,11 +162,42 @@ def _(x: BaseCompressedSparseDataset, *, copy: bool = False):
     return x.to_memory()
 
 
-def _wrap_block(block: CSMatrix | CSArray) -> np.ndarray:
-    """Wrap a chunk in a 1x1 object array so dask stacks references, not data."""
-    wrapped = np.empty((1, 1), dtype=object)
-    wrapped[0, 0] = block
-    return wrapped
+class _ArrayChunks:
+    """Dask collection that computes to the chunks of an array as a nested list.
+
+    Implements dask’s collection protocol (see “Internals → Custom Collections”)
+    on top of an array’s graph, but skips the array’s own finalization
+    (concatenation), so :func:`dask.compute` returns every chunk as its own
+    scheduler output, exactly as :meth:`dask.array.Array.to_delayed` would.
+    """
+
+    def __init__(self, array: DaskArray) -> None:
+        self._array = array
+
+    def __dask_graph__(self):
+        return self._array.__dask_graph__()
+
+    def __dask_keys__(self):
+        return self._array.__dask_keys__()
+
+    def __dask_layers__(self):
+        return self._array.__dask_layers__()
+
+    def __dask_tokenize__(self):
+        return (type(self).__name__, self._array.name)
+
+    def __dask_optimize__(self, dsk, keys, **kwargs):
+        return self._array.__dask_optimize__(dsk, keys, **kwargs)
+
+    def __dask_scheduler__(self, dsk, keys, **kwargs):
+        return self._array.__dask_scheduler__(dsk, keys, **kwargs)
+
+    def __dask_postcompute__(self):
+        return _identity, ()
+
+
+def _identity(results):
+    return results
 
 
 def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray | np.ndarray:
@@ -179,27 +210,24 @@ def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray | np.ndarray:
     with scipy keeps the parallelism but avoids these extra copies.
     See https://github.com/scverse/anndata/issues/2185
     """
-    import dask.array as da
+    import dask
     from scipy import sparse
 
-    # A single `compute` keeps the scheduler’s parallelism; dask only has to
-    # assemble a cheap object array of chunk references instead of the data.
-    blocks: np.ndarray = da.map_blocks(
-        _wrap_block,
-        x,
-        chunks=tuple((1,) * n for n in x.numblocks),
-        dtype=object,
-        meta=np.empty((0, 0), dtype=object),
-    ).compute()
+    # One scheduler pass, each chunk returned on its own (no gathering task)
+    (grid,) = dask.compute(_ArrayChunks(x))
+    blocks = np.empty(x.numblocks, dtype=object)
+    for i, row in enumerate(grid):
+        for j, block in enumerate(row):
+            blocks[i, j] = block
+    n_block_rows, n_block_cols = blocks.shape
+    if n_block_rows == n_block_cols == 1:
+        # like dask, don’t hand out the chunk itself (it might be persisted)
+        return blocks[0, 0].copy()
     if not all(isinstance(block, CSMatrix | CSArray) for block in blocks.flat):
         # `_meta` was wrong about the chunks; behave like `.compute()` would
         from dask.array.core import concatenate3
 
         return concatenate3(blocks.tolist())
-    n_block_rows, n_block_cols = blocks.shape
-    if n_block_rows == n_block_cols == 1:
-        # like dask, don’t hand out the chunk itself (it might be persisted)
-        return blocks[0, 0].copy()
     # scipy’s stacking keeps the format when the chunks agree, like dask does
     rows = [row[0] if n_block_cols == 1 else sparse.hstack(list(row)) for row in blocks]
     return rows[0] if n_block_rows == 1 else sparse.vstack(rows)

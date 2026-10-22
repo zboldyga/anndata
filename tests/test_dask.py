@@ -437,8 +437,13 @@ def test_to_memory_copy_raw():
         pytest.param((0, 40), (-1, -1), id="empty"),
     ],
 )
+@pytest.mark.parametrize("canonical", [True, False], ids=["canonical", "messy"])
 def test_to_memory_sparse_dask_blockwise(
-    sparse_type: type[CSMatrix | CSArray], shape: tuple[int, int], chunks
+    sparse_type: type[CSMatrix | CSArray],
+    shape: tuple[int, int],
+    chunks,
+    *,
+    canonical: bool,
 ) -> None:
     """Sparse dask arrays are materialized block by block, see #2185."""
     import dask.array as da
@@ -450,6 +455,24 @@ def test_to_memory_sparse_dask_blockwise(
             *shape, density=0.3, format="csr", random_state=np.random.default_rng(0)
         )
     )
+    if not canonical:  # wide index dtype, unsorted and duplicate indices
+        coo = mat.tocoo()
+        mat = sparse_type(
+            (
+                np.concatenate([coo.data, coo.data[:2]]),
+                (
+                    np.concatenate([coo.row, coo.row[:2]]).astype(np.int64),
+                    np.concatenate([coo.col, coo.col[:2]]).astype(np.int64),
+                ),
+            ),
+            shape=shape,
+        )
+        mat.indices, mat.indptr = (
+            mat.indices.astype(np.int64),
+            mat.indptr.astype(np.int64),
+        )
+        mat.indices[-2:] = mat.indices[-2:][::-1]
+        mat.has_sorted_indices = False
     x = da.from_array(mat, chunks=chunks)
 
     result = to_memory(x)
@@ -460,7 +483,9 @@ def test_to_memory_sparse_dask_blockwise(
     assert result.shape == mat.shape
     assert result.indices.dtype == computed.indices.dtype
     assert result.indptr.dtype == computed.indptr.dtype
+    assert result.has_sorted_indices == computed.has_sorted_indices
     assert result.has_canonical_format == computed.has_canonical_format
+    assert result.nnz == computed.nnz
     assert_equal(result, mat)
     assert_equal(result, computed)
 
@@ -498,6 +523,7 @@ def test_to_memory_sparse_dask_1d_uns() -> None:
     np.testing.assert_array_equal(result.uns["sparse_1d"].toarray(), [1, 0, 2])
 
 
+@pytest.mark.skipif(not DASK_CAN_SPARRAY, reason="Dask does not support sparrays")
 def test_to_memory_sparse_dask_anndata_elements() -> None:
     """Sparse dask arrays in X, layers, obsm, varm and raw are all materialized."""
     import dask.array as da
@@ -529,6 +555,37 @@ def test_to_memory_sparse_dask_anndata_elements() -> None:
         assert loaded.format == computed.format
         assert loaded.indices.dtype == computed.indices.dtype
         assert_equal(loaded, computed)
+
+
+@pytest.mark.parametrize(
+    ("to_chunk_type", "chunks"),
+    [
+        pytest.param(sparse.dok_matrix, (-1, -1), id="dok-single_chunk"),
+        pytest.param(sparse.lil_matrix, (-1, -1), id="lil-single_chunk"),
+        pytest.param(sparse.coo_matrix, (4, -1), id="coo-row_chunks"),
+        pytest.param(sparse.csc_matrix, (4, 3), id="csc-grid_chunks"),
+    ],
+)
+def test_to_memory_sparse_meta_other_chunks(
+    to_chunk_type: Callable, chunks: tuple[int, int]
+) -> None:
+    """Chunks whose runtime format differs from `_meta` behave like `.compute()`."""
+    import dask.array as da
+
+    from anndata._core.file_backing import to_memory
+
+    mat = sparse.csr_matrix(np.arange(60, dtype=np.float32).reshape(12, 5))
+    x = da.from_array(mat, chunks=chunks).map_blocks(
+        to_chunk_type, meta=sparse.csr_matrix((0, 0), dtype=np.float32)
+    )
+    assert isinstance(x._meta, CSMatrix)
+
+    result = to_memory(x)
+
+    computed = x.compute()
+    assert type(result) is type(computed)
+    assert result.format == computed.format
+    np.testing.assert_array_equal(result.toarray(), mat.toarray())
 
 
 def test_to_memory_sparse_meta_dense_chunks() -> None:
