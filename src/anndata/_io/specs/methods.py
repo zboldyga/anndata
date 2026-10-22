@@ -1261,12 +1261,13 @@ def write_categorical(
     g.attrs["ordered"] = bool(v.ordered)
 
     _writer.write_elem(g, "codes", v.codes, dataset_kwargs=dataset_kwargs)
-    _writer.write_elem(
-        g,
-        "categories",
-        v.categories.to_numpy(),
-        dataset_kwargs=dataset_kwargs,
+    # `to_numpy` would turn timezone-aware datetimes into an object array of timestamps
+    categories = (
+        v.categories.array
+        if isinstance(v.categories.dtype, pd.DatetimeTZDtype)
+        else v.categories.to_numpy()
     )
+    _writer.write_elem(g, "categories", categories, dataset_kwargs=dataset_kwargs)
 
 
 @_REGISTRY.register_read(h5py.Group, IOSpec("categorical", "0.2.0"))
@@ -1551,7 +1552,9 @@ def _localize_datetime_array(
     # Stored values are UTC based, so localizing to UTC is unambiguous
     localized = pd.array(values.reshape(-1)).tz_localize("UTC").tz_convert(tz)
     # A scalar selection becomes a timestamp (going through the array keeps the unit)
-    return localized[0] if values.ndim == 0 else localized
+    if values.ndim == 0:
+        return localized[0]
+    return localized if values.ndim == 1 else localized.reshape(values.shape)
 
 
 for _store_type in _STORE_TYPES:

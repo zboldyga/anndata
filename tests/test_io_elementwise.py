@@ -182,6 +182,11 @@ def create_sparse_store[G: h5py.Group | zarr.Group](
             id="pd_cat_datetime",
         ),
         pytest.param(
+            pd.Categorical(pd.date_range("2018", periods=3, tz="Europe/Berlin")),
+            "categorical",
+            id="pd_cat_datetime_tz",
+        ),
+        pytest.param(
             pd.date_range("2018-01-01", periods=5, freq="h").to_numpy(),
             "datetime-array",
             id="np_arr_datetime",
@@ -791,6 +796,12 @@ def test_write_io_error(store, obj):
             id="pd_datetime_tz_far_future",
         ),
         pytest.param(
+            pd.array(pd.date_range("2020", periods=6, tz="UTC")).reshape(2, 3),
+            "datetime-array",
+            "UTC",
+            id="pd_datetime_tz_2d",
+        ),
+        pytest.param(
             pd.array(pd.to_timedelta([1, None, 3], unit="s")),
             "timedelta-array",
             None,
@@ -823,6 +834,10 @@ def test_io_datetime_like(
     assert np.dtype(elem.dtype) == np.dtype(np.int64)
 
     from_disk = read_elem(elem)
+    assert isinstance(
+        from_disk, np.ndarray | pd.arrays.DatetimeArray | pd.arrays.TimedeltaArray
+    )
+    assert from_disk.shape == value.shape
     if tz is not None:
         assert isinstance(value, pd.arrays.DatetimeArray)
         assert isinstance(from_disk, pd.arrays.DatetimeArray)
@@ -847,13 +862,17 @@ def test_io_datetime_like(
     # Partial reads keep the dtype as well
     partial = read_elem_partial(elem, indices=slice(1, None))
     assert partial.dtype == from_disk.dtype
-    assert len(partial) == len(value) - 1
+    assert partial.shape == (len(value) - 1, *value.shape[1:])
+    assert read_elem_partial(elem, indices=slice(0, 0)).shape == (0, *value.shape[1:])
     first = read_elem_partial(elem, indices=0)
-    if tz is not None:
+    if tz is not None and value.ndim == 1:
         assert isinstance(first, pd.Timestamp)
         assert isinstance(value, pd.arrays.DatetimeArray)
         assert first == from_disk[0]
         assert first.unit == value.unit
+    elif tz is not None:
+        assert isinstance(first, pd.arrays.DatetimeArray)
+        pd.testing.assert_extension_array_equal(first, from_disk[0])
     else:
         np.testing.assert_array_equal(first, from_disk[0])
 
@@ -934,6 +953,9 @@ def test_read_lazy_dataframe_datetime_columns(store: _GroupStorageType) -> None:
             "timedelta": np.array([1, "NaT"], dtype="timedelta64[s]"),
             "datetime_cat": pd.Categorical(
                 pd.to_datetime(["2020-01-01", "2021-01-01"])
+            ),
+            "datetime_tz_cat": pd.Categorical(
+                pd.date_range("2020", periods=2, tz="UTC")
             ),
             "timedelta_cat": pd.Categorical(pd.to_timedelta([1, 2], unit="s")),
         },
