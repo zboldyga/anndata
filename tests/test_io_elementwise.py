@@ -761,12 +761,12 @@ def test_write_nullable_string(
     ],
 )
 def test_write_spec_keeps_attrs_set_by_writer(
-    tmp_path: Path, fmt: str, preset: frozenset[str]
+    tmp_path: Path, exit_stack: ExitStack, fmt: str, preset: frozenset[str]
 ):
     """The ``write_spec`` wrapper only adds missing encoding attrs, never touching existing ones."""
     store: h5py.Group | zarr.Group
     if fmt == "h5ad":
-        store = h5py.File(tmp_path / "test.h5ad", "w")["/"]
+        store = exit_stack.enter_context(h5py.File(tmp_path / "test.h5ad", "w"))["/"]
     else:
         zarr_format: Literal[2, 3] = 2 if fmt == "zarr-v2" else 3
         store = zarr.open_group(MemoryStore(), mode="w", zarr_format=zarr_format)
