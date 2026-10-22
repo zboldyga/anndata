@@ -35,7 +35,7 @@ from anndata._core.views import (
     SparseCSRMatrixView,
 )
 from anndata._warnings import ImplicitModificationWarning
-from anndata.compat import DaskArray, XDataArray
+from anndata.compat import DaskArray, IndexManager, XDataArray
 from anndata.tests.helpers import (
     BASE_MATRIX_PARAMS,
     CUPY_MATRIX_PARAMS,
@@ -1138,3 +1138,115 @@ def test_double_index_jax(*, to_bool: bool, mixed: bool) -> None:
         v2 = adata[subset1, :][subset2, :]
 
     assert_equal(v1, v2)
+
+
+# Public API for subclassing (issue #1947)
+
+
+def test_public_view_api_exports() -> None:
+    assert ad.experimental.DataFrameView is ad._core.views.DataFrameView
+    assert "DataFrameView" in ad.experimental.__all__
+    assert ad.experimental.resolve_idx is ad._core.views.resolve_idx
+    assert "resolve_idx" in ad.experimental.__all__
+
+
+def test_public_dataframe_view() -> None:
+    adata = gen_adata((10, 8))
+    view = adata[:3]
+    assert isinstance(view.obs, ad.experimental.DataFrameView)
+    assert isinstance(view.var, ad.experimental.DataFrameView)
+    assert not isinstance(adata.obs, ad.experimental.DataFrameView)
+
+    # Can be constructed directly for a custom aligned attribute
+    df = pd.DataFrame(dict(a=[1, 2, 3]), index=view.obs_names)
+    custom = ad.experimental.DataFrameView(df, view_args=(view, "obs"))
+    assert isinstance(custom, pd.DataFrame)
+    assert custom._view_args is not None
+    assert custom._view_args.parent is view
+    assert custom._view_args.attrname == "obs"
+    # With `view_args=None`, it behaves like a plain DataFrame
+    plain = ad.experimental.DataFrameView(df, view_args=None)
+    plain["b"] = 0  # no ImplicitModificationWarning (strict warnings would fail)
+    assert plain._view_args is None
+
+
+_RESOLVE_IDX_LENGTH = 10
+# every `old` index selects 7 of the 10 elements
+_RESOLVE_IDX_OLD = {
+    "slice": slice(2, 9),
+    "slice_neg_step": slice(8, 1, -1),
+    "int_array": np.array([1, 3, 4, 6, 8, 9, 0]),
+    "bool_array": np.array([
+        True,
+        False,
+        True,
+        True,
+        False,
+        True,
+        True,
+        True,
+        False,
+        True,
+    ]),
+}
+_RESOLVE_IDX_NEW = {
+    "slice": slice(1, 5),
+    "slice_neg_step": slice(None, None, -1),
+    "slice_empty": slice(3, 3),
+    "int": 2,
+    "np_int": np.int64(3),
+    "int_array": np.array([4, 0, 2]),
+    "int_list": [3, 1],
+    "bool_array": np.array([True, False, False, True, True, False, True]),
+    "bool_list": [False, True, True, False, False, True, True],
+}
+
+
+@pytest.mark.parametrize("old", _RESOLVE_IDX_OLD.values(), ids=_RESOLVE_IDX_OLD.keys())
+@pytest.mark.parametrize("new", _RESOLVE_IDX_NEW.values(), ids=_RESOLVE_IDX_NEW.keys())
+def test_resolve_idx(
+    old: slice | np.ndarray, new: slice | int | np.integer | np.ndarray | list
+) -> None:
+    arr = np.arange(_RESOLVE_IDX_LENGTH)
+    resolved = ad.experimental.resolve_idx(old, new, _RESOLVE_IDX_LENGTH)
+    assert isinstance(resolved, slice | np.ndarray | np.integer)
+    np.testing.assert_array_equal(arr[resolved], arr[old][new])
+
+    if isinstance(old, slice) and isinstance(new, slice):
+        assert isinstance(resolved, slice)
+    elif isinstance(new, int | np.integer):
+        assert isinstance(resolved, np.integer)
+    else:
+        assert isinstance(resolved, np.ndarray)
+        if (
+            isinstance(old, np.ndarray)
+            and old.dtype == bool
+            and np.asarray(new).dtype == bool
+        ):
+            assert resolved.dtype == bool
+            assert resolved.shape == old.shape
+        else:
+            assert np.issubdtype(resolved.dtype, np.integer)
+
+
+def test_resolve_idx_matches_view_of_view(subset_func, subset_func2) -> None:
+    if subset_func in {single_subset, single_int_subset}:
+        pytest.xfail("Other subset generating functions have trouble with this")
+    adata = gen_adata((10, 8))
+    v1 = adata[subset_func(adata.obs_names, min_size=4)]
+    oidx2 = _normalize_index(subset_func2(v1.obs_names), v1.obs_names)
+    v2 = v1[oidx2]
+    # `v1._oidx` is the normalized index stored by the view
+    assert v1._oidx is not None
+    resolved = ad.experimental.resolve_idx(v1._oidx, oidx2, adata.n_obs)
+    # views wrap array indices in an `IndexManager`, which is passed through
+    if isinstance(resolved, IndexManager):
+        resolved = np.asarray(resolved.get_default())
+    assert isinstance(resolved, slice | np.ndarray | np.integer)
+    v3 = adata[int(resolved) if isinstance(resolved, np.integer) else resolved]
+    assert_equal(v3, v2)
+
+
+def test_resolve_idx_unsupported_old() -> None:
+    with pytest.raises(TypeError, match="Unrecognized indexer"):
+        ad.experimental.resolve_idx("a", slice(None), 3)  # type: ignore[arg-type]

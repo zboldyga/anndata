@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from .._core.views import DataFrameView, resolve_idx
 from .._io.specs import IOSpec, read_elem_lazy
 from .._types import (
     Dataset2DIlocIndexer,
@@ -52,6 +53,7 @@ __all__ = [
     "AnnCollection",
     "AnnCollectionView",
     "AnnLoader",
+    "DataFrameView",
     "Dataset2DIlocIndexer",
     "IOSpec",
     "Read",
@@ -63,5 +65,6 @@ __all__ = [
     "read_dispatched",
     "read_elem_lazy",
     "read_lazy",
+    "resolve_idx",
     "write_dispatched",
 ]

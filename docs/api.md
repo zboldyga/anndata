@@ -217,6 +217,21 @@ Types used by the former:
    experimental.StorageType
 ```
 
+Building blocks for subclassing {class}`AnnData`, e.g. to add further aligned attributes or axes:
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+   :template: class-minimal
+
+   experimental.DataFrameView
+
+.. autosummary::
+   :toctree: generated/
+
+   experimental.resolve_idx
+```
+
 (extensions-api)=
 
 ## Extensions

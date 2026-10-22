@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import reduce, singledispatch
@@ -32,7 +33,7 @@ from .access import ElementRef
 from .xarray import Dataset2D
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable
     from typing import Any, ClassVar
 
     from numpy.typing import NDArray
@@ -297,6 +298,32 @@ class DictView(_ViewMixin, dict):
 
 
 class DataFrameView(_ViewMixin, pd.DataFrame):
+    """A :class:`pandas.DataFrame` that is a view of an attribute of an :class:`~anndata.AnnData` view.
+
+    Instances are returned by e.g. :attr:`AnnData.obs <anndata.AnnData.obs>`
+    when the :class:`~anndata.AnnData` object is a view.
+    Modifying one (e.g. via ``__setitem__``, :meth:`drop` with ``inplace=True``,
+    or assigning its ``index``) emits an :class:`~anndata.ImplicitModificationWarning`
+    and turns the parent view into an actual :class:`~anndata.AnnData`
+    before applying the modification to the parent’s attribute.
+
+    This class is useful when subclassing :class:`~anndata.AnnData`
+    with additional aligned data frames.
+
+    Parameters
+    ----------
+    *args
+        Positional arguments passed to :class:`pandas.DataFrame`.
+    view_args
+        Reference to the parent view’s element this data frame is a view of:
+        ``(parent, attr_name)`` or ``(parent, attr_name, keys)``,
+        e.g. ``(adata_view, "obs")``.
+        `None` creates a data frame without a parent that behaves like a plain
+        :class:`pandas.DataFrame`.
+    **kwargs
+        Keyword arguments passed to :class:`pandas.DataFrame`.
+    """
+
     _metadata: ClassVar = ["_view_args"]
 
     def drop(self, *args, inplace: bool = False, **kw):
@@ -489,6 +516,62 @@ def _resolve_idx(
 ) -> _Index1DNorm[IndexManager]:
     msg = f"Unrecognized indexer of type {type(old)}"
     raise TypeError(msg)
+
+
+def resolve_idx(
+    old: _Index1DNorm[IndexManager],
+    new: _Index1DNorm[IndexManager] | int | np.integer | Sequence[int] | Sequence[bool],
+    length: int,
+) -> _Index1DNorm[IndexManager] | np.integer:
+    """Compose two consecutive 1D indices into one index relative to the original axis.
+
+    When a view of a view is created, the indices of both subsetting operations
+    need to be combined into a single index into the original object.
+    This function does that for one axis: ``arr[resolve_idx(old, new, len(arr))]``
+    selects the same elements as ``arr[old][new]``.
+
+    Parameters
+    ----------
+    old
+        Index that was already applied to the axis of the original object:
+        a :class:`slice`, an integer or boolean :class:`numpy.ndarray`,
+        or an array-API compatible array.
+    new
+        Index relative to the subset created by `old`.
+        Can be any of the types accepted for `old`,
+        an integer, or a sequence of integers or booleans.
+    length
+        Length of the axis of the original object.
+        Only used to resolve slices.
+
+    Returns
+    -------
+    A single index relative to the original axis.
+    Composing two slices yields a :class:`slice`,
+    composing two boolean masks yields a boolean mask,
+    and indexing with an integer yields an integer.
+
+    Raises
+    ------
+    TypeError
+        If `old` is not one of the supported index types.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from anndata.experimental import resolve_idx
+    >>> resolve_idx(slice(2, 8), slice(None, None, 2), 10)
+    slice(2, 8, 2)
+    >>> resolve_idx(np.array([1, 3, 5]), [2, 0], 6)
+    array([5, 1])
+    >>> resolve_idx(
+    ...     np.array([True, False, True, True]), np.array([False, True, True]), 4
+    ... )
+    array([False, False,  True,  True])
+    """
+    if isinstance(new, int | np.integer | Sequence):
+        new = np.asarray(new)
+    return _resolve_idx(old, new, length)
 
 
 @_resolve_idx.register(SupportsArrayApiBase)
