@@ -1276,6 +1276,25 @@ def test_resolve_idx_empty_axis(old: slice | np.ndarray, new: slice | list) -> N
     assert arr[resolved].shape == (0,)
 
 
+@pytest.mark.parametrize(
+    "mod", ["np", pytest.param("jnp", marks=pytest.mark.array_api)]
+)
+def test_resolve_idx_empty_bool_mask(mod: str) -> None:
+    """An all-false mask followed by an empty mask stays a mask of the original shape."""
+    xp = dict(np=np, jnp=jnp)[mod]
+    assert xp is not None
+    old = xp.asarray([False, False, False])
+    resolved = ad.experimental.resolve_idx(old, xp.asarray([], dtype=bool), 3)
+    assert isinstance(resolved, type(old))
+    assert resolved.dtype == bool
+    assert resolved.shape == (3,)
+    assert not np.asarray(resolved).any()
+    # whereas an untyped empty sequence is an empty integer index
+    resolved = ad.experimental.resolve_idx(old, [], 3)
+    assert resolved.shape == (0,)
+    assert np.issubdtype(np.asarray(resolved).dtype, np.integer)
+
+
 @pytest.mark.array_api
 @pytest.mark.parametrize("new", [slice(None), slice(1, None), 1, [2, 0], []])
 def test_resolve_idx_array_api_bool_mask(new: slice | int | list) -> None:

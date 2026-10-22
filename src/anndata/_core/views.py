@@ -584,7 +584,8 @@ def resolve_idx(
         # convert using the namespace of `old` so array-API indices can be composed
         xp = old.__array_namespace__() if has_xp_base(old) else np
         new_arr = xp.asarray(new)
-        if new_arr.size == 0:  # an empty sequence is an empty integer index
+        if new_arr.size == 0 and not has_xp_base(new):
+            # an empty untyped sequence is an empty integer index, not a float array
             new_arr = xp.asarray(new, dtype=xp.asarray(0).dtype)
         new = cast("SupportsArrayApiBase", new_arr)
     resolved = _resolve_idx(old, new, length)
