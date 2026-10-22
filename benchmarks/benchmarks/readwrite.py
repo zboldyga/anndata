@@ -143,6 +143,35 @@ class H5ADWriteSuite:
         ))
 
 
+class UnsManyKeysSuite:
+    """IO of an ``uns`` dict with many small entries (issue 1684)."""
+
+    params = (["h5ad", "zarr"], [10_000])
+    param_names = ("diskfmt", "n_keys")
+
+    def setup(self, diskfmt: str, n_keys: int):
+        self.adata = anndata.AnnData(
+            uns=dict(
+                strings={str(i): str(i) for i in range(n_keys)},
+                arrays={str(i): np.arange(i % 10) for i in range(n_keys)},
+            )
+        )
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.writepth = Path(self.tmpdir.name) / f"out.{diskfmt}"
+        self.write = getattr(self.adata, f"write_{diskfmt}")
+        self.read = getattr(anndata, f"read_{diskfmt}")
+        self.write(self.writepth)
+
+    def teardown(self, *_):
+        self.tmpdir.cleanup()
+
+    def time_write(self, *_):
+        self.write(self.writepth)
+
+    def time_read(self, *_):
+        self.read(self.writepth)
+
+
 class H5ADBackedWriteSuite(H5ADWriteSuite):
     _urls = MappingProxyType(dict(pbmc3k=PBMC_3K_URL))
     params = _urls.keys()

@@ -20,8 +20,8 @@ from scipy import sparse
 from zarr.storage import MemoryStore
 
 import anndata as ad
-from anndata._io.specs import _REGISTRY, IOSpec, get_spec
-from anndata._io.specs.registry import IORegistryError
+from anndata._io.specs import _REGISTRY, IOSpec, Writer, get_spec
+from anndata._io.specs.registry import IORegistry, IORegistryError
 from anndata.compat import CSArray, CSMatrix, DaskArray, _read_attr
 from anndata.experimental import read_elem_lazy
 from anndata.io import read_elem, write_elem
@@ -748,6 +748,39 @@ def test_write_nullable_string(
 
     if isinstance(expected, str):
         assert store["el"].attrs["encoding-type"] == expected
+
+
+def test_write_spec_keeps_attrs_set_by_writer(store: _GroupStorageType):
+    """The ``write_spec`` wrapper must not overwrite attributes the writer itself set."""
+    registry = IORegistry()
+    spec = IOSpec("custom", "9.9.9")
+
+    @registry.register_write(h5py.Group, np.ndarray, spec)
+    @registry.register_write(zarr.Group, np.ndarray, spec)
+    def write_custom(f, k, elem, *, _writer, dataset_kwargs):
+        write_elem(f, k, elem)  # sets encoding-type "array" and its version
+        f[k].attrs["extra"] = "kept"
+
+    Writer(registry).write_elem(store, "el", np.arange(3))
+
+    assert _read_attr(store["el"].attrs, "encoding-type") == "array"
+    assert _read_attr(store["el"].attrs, "encoding-version") != spec.encoding_version
+    assert _read_attr(store["el"].attrs, "extra") == "kept"
+
+
+def test_many_small_elems_roundtrip(store: _GroupStorageType):
+    """https://github.com/scverse/anndata/issues/1684"""
+    n = 200
+    value = {
+        **{f"s{i}": str(i) for i in range(n)},
+        **{f"a{i}": np.arange(i % 5) for i in range(n)},
+        "nested": {str(i): np.array(str(i), dtype="object") for i in range(n)},
+    }
+    write_elem(store, "d", value)
+    assert get_spec(store["d"]) == IOSpec("dict", "0.1.0")
+    assert get_spec(store["d/s0"]) == IOSpec("string", "0.2.0")
+    assert get_spec(store["d/a0"]) == IOSpec("array", "0.2.0")
+    assert_equal(read_elem(store["d"]), value)
 
 
 def test_categorical_order_type(store):

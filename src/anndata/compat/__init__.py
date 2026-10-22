@@ -332,6 +332,8 @@ def _read_attr_hdf5[T](
     if name not in attrs and default is not Empty.TOKEN:
         return default
     attr = attrs[name]
+    if isinstance(attr, str):  # variable-length string, no conversion needed
+        return attr
     attr_id = attrs.get_id(name)
     dtype = h5py.check_string_dtype(attr_id.dtype)
     if dtype is None or dtype.length is None:  # variable-length string, no problem

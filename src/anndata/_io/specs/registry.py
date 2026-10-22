@@ -93,13 +93,37 @@ class IORegistryError(Exception):
         return cls(msg)
 
 
+def _set_missing_attrs(node: StorageType, attrs_to_set: Mapping[str, str]) -> None:
+    """\
+    Set attributes on a node without overwriting existing ones (``setdefault`` semantics).
+
+    Done with a single attribute-manager access and a single metadata write:
+    for zarr, every ``attrs[k] = v`` rewrites the node’s metadata document,
+    which dominates the cost of writing many small elements (see issue 1684).
+    """
+    attrs = node.attrs
+    missing: dict[str, Any] = {k: v for k, v in attrs_to_set.items() if k not in attrs}
+    if not missing:
+        return
+    if isinstance(node, zarr.Array | zarr.Group):
+        node.update_attributes(missing)
+    else:
+        for name, value in missing.items():
+            attrs[name] = value
+
+
 def write_spec[W: Callable[..., Any]](spec: IOSpec) -> Callable[[W], W]:
+    encoding_attrs = MappingProxyType({
+        "encoding-type": spec.encoding_type,
+        "encoding-version": spec.encoding_version,
+    })
+
     def decorator(func: W) -> W:
         @wraps(func)
         def wrapper(g: _GroupStorageType, k: str, *args, **kwargs):
             result = func(g, k, *args, **kwargs)
-            g[k].attrs.setdefault("encoding-type", spec.encoding_type)
-            g[k].attrs.setdefault("encoding-version", spec.encoding_version)
+            # Look the written node up once instead of once per attribute
+            _set_missing_attrs(g[k], encoding_attrs)
             return result
 
         # a wrapper can never structurally match the wrapped function’s type
@@ -263,8 +287,9 @@ def proc_spec_mapping(spec: Mapping[str, str]) -> IOSpec:
 
 
 def get_spec(elem: StorageType) -> IOSpec:
+    attrs = elem.attrs  # accessing `.attrs` is not free, do it once
     return proc_spec({
-        k: _read_attr(elem.attrs, k, "") for k in ["encoding-type", "encoding-version"]
+        k: _read_attr(attrs, k, "") for k in ["encoding-type", "encoding-version"]
     })
 
 
