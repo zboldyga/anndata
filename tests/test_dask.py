@@ -621,10 +621,12 @@ def test_to_memory_sparse_dask_single_pass(monkeypatch: pytest.MonkeyPatch) -> N
     x = da.from_array(mat, chunks=(10, 10))
     n_passes = 0
     n_dask_concats = 0
+    requested_keys: list = []
 
     def counting_get(dsk, keys, **kwargs):
         nonlocal n_passes
         n_passes += 1
+        requested_keys[:] = keys
         return dask.get(dsk, keys, **kwargs)
 
     dask_concatenate = da_core._concatenate2
@@ -647,6 +649,10 @@ def test_to_memory_sparse_dask_single_pass(monkeypatch: pytest.MonkeyPatch) -> N
         result = to_memory(x)
     assert n_passes == 1
     assert n_dask_concats == 0
+    # every chunk is requested from the scheduler directly:
+    # no finalize task that would gather all chunks on one worker
+    chunk_keys = {(x.name, i, j) for i in range(6) for j in range(2)}
+    assert set(requested_keys) == chunk_keys
     assert_equal(result, mat)
 
 

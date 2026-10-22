@@ -162,44 +162,6 @@ def _(x: BaseCompressedSparseDataset, *, copy: bool = False):
     return x.to_memory()
 
 
-class _ArrayChunks:
-    """Dask collection that computes to the chunks of an array as a nested list.
-
-    Implements dask’s collection protocol (see “Internals → Custom Collections”)
-    on top of an array’s graph, but skips the array’s own finalization
-    (concatenation), so :func:`dask.compute` returns every chunk as its own
-    scheduler output, exactly as :meth:`dask.array.Array.to_delayed` would.
-    """
-
-    def __init__(self, array: DaskArray) -> None:
-        self._array = array
-
-    def __dask_graph__(self):
-        return self._array.__dask_graph__()
-
-    def __dask_keys__(self):
-        return self._array.__dask_keys__()
-
-    def __dask_layers__(self):
-        return self._array.__dask_layers__()
-
-    def __dask_tokenize__(self):
-        return (type(self).__name__, self._array.name)
-
-    def __dask_optimize__(self, dsk, keys, **kwargs):
-        return self._array.__dask_optimize__(dsk, keys, **kwargs)
-
-    def __dask_scheduler__(self, dsk, keys, **kwargs):
-        return self._array.__dask_scheduler__(dsk, keys, **kwargs)
-
-    def __dask_postcompute__(self):
-        return _identity, ()
-
-
-def _identity(results):
-    return results
-
-
 def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray | np.ndarray:
     """Materialize a 2D dask array of scipy sparse chunks without dask’s final concatenation.
 
@@ -213,12 +175,12 @@ def _compute_sparse_blockwise(x: DaskArray) -> CSMatrix | CSArray | np.ndarray:
     import dask
     from scipy import sparse
 
-    # One scheduler pass, each chunk returned on its own (no gathering task)
-    (grid,) = dask.compute(_ArrayChunks(x))
-    blocks = np.empty(x.numblocks, dtype=object)
-    for i, row in enumerate(grid):
-        for j, block in enumerate(row):
-            blocks[i, j] = block
+    # One scheduler pass; every chunk is its own output, so nothing gathers
+    # them on a single worker and no dask-side concatenation happens.
+    delayed = x.to_delayed()
+    blocks = np.empty(delayed.shape, dtype=object)
+    for i, block in enumerate(dask.compute(*delayed.ravel())):
+        blocks.flat[i] = block
     n_block_rows, n_block_cols = blocks.shape
     if n_block_rows == n_block_cols == 1:
         # like dask, don’t hand out the chunk itself (it might be persisted)
