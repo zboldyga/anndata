@@ -18,6 +18,7 @@ import pandas as pd
 from natsort import natsorted
 from scipy import sparse
 
+from anndata._core.aligned_mapping import OnDiskArray
 from anndata._core.file_backing import to_memory
 from anndata._warnings import ExperimentalFeatureWarning
 
@@ -1935,7 +1936,16 @@ def _merge_raw(
         warn(msg, UserWarning)
         return None
     (raw, reindexer), *_ = with_raw
-    return {"X": reindexer(raw.X, axis=0), "var": raw.var, "varm": dict(raw.varm)}
+    return {
+        "X": reindexer(_load_if_backed(raw.X), axis=0),
+        "var": raw.var,
+        "varm": dict(raw.varm),
+    }
+
+
+def _load_if_backed(el):
+    """Load on-disk (backed) elements into memory; pass everything else through."""
+    return to_memory(el) if isinstance(el, OnDiskArray) else el
 
 
 def merge(
@@ -1990,6 +2000,7 @@ def merge(
     Like the :class:`~anndata.AnnData` constructor, `merge` does not copy elements
     that need no reindexing, so the result may share memory with its inputs.
     Call :meth:`~anndata.AnnData.copy` on the result if you need independent data.
+    The result is always in memory: backed `X` and `raw.X` are loaded.
 
     :attr:`~anndata.AnnData.raw` is kept only when exactly one object has it;
     otherwise a warning is emitted and the result has no `.raw`.
@@ -2074,6 +2085,7 @@ def merge(
         """
 
         def reindex(el, obs_r: Reindexer, var_r: Reindexer):
+            el = _load_if_backed(el)
             for axis_name, el_axis in axes:
                 r = obs_r if axis_name == "obs" else var_r
                 el = r(el, axis=el_axis, fill_value=fill_value)

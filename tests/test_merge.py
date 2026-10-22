@@ -306,6 +306,22 @@ def test_errors(expr: AnnData):
         ad.merge([expr, dup])
 
 
+def test_backed_input_is_loaded(expr: AnnData, pca: AnnData, tmp_path):
+    path = tmp_path / "expr.h5ad"
+    expr.raw = expr
+    expr.write_h5ad(path)
+    backed = ad.read_h5ad(path, backed="r")
+    assert backed.isbacked
+    merged = ad.merge([backed, pca])
+    assert not merged.isbacked
+    assert isinstance(merged.X, np.ndarray)
+    assert merged.raw is not None
+    assert isinstance(merged.raw.X, np.ndarray)
+    assert_equal(merged.X, expr.X)
+    reordered = ad.merge([backed, pca[["s2", "s1"]]])
+    assert_equal(reordered.X, expr[["s1", "s2"]].X)
+
+
 def test_dask_elements(expr: AnnData):
     da = pytest.importorskip("dask.array")
     lazy = _empty(
