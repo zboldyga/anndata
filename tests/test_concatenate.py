@@ -1915,3 +1915,32 @@ def test_1d_concat():
     adata = AnnData(np.ones((5, 20)), obsm={"1d-array": np.ones(5)})
     concated = concat([adata, adata])
     assert concated.obsm["1d-array"].shape == (10, 1)
+
+
+def test_concat_outer_awkward_alt_axis_pads_missing():
+    """Reindexing an awkward array along the non-concatenation axis fills missing entries with `None`."""
+    ak = pytest.importorskip("awkward")
+    a = AnnData(
+        obs=pd.DataFrame(index=["s1"]),
+        var=pd.DataFrame(index=["a", "b"]),
+        varm={"awk": ak.Array([[1], [2, 3]])},
+    )
+    b = AnnData(obs=pd.DataFrame(index=["s2"]), var=pd.DataFrame(index=["c"]))
+    result = concat([a, b], join="outer", merge="first")
+    assert list(result.var_names) == ["a", "b", "c"]
+    assert result.varm["awk"].to_list() == [[1], [2, 3], None]
+
+
+@pytest.mark.parametrize("merge_strategy", ["same", "unique"])
+def test_concat_merge_equal_dense_and_sparse_order_independent(merge_strategy):
+    var = pd.DataFrame(index=["a", "b"])
+    dense = AnnData(
+        obs=pd.DataFrame(index=["s1"]), var=var, varm={"m": np.ones((2, 2))}
+    )
+    sp = AnnData(
+        obs=pd.DataFrame(index=["s2"]),
+        var=var,
+        varm={"m": sparse.csr_matrix(np.ones((2, 2)))},
+    )
+    assert "m" in concat([dense, sp], merge=merge_strategy).varm
+    assert "m" in concat([sp, dense], merge=merge_strategy).varm

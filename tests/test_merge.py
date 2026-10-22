@@ -384,21 +384,82 @@ def test_raw_without_x():
         obs=pd.DataFrame(index=["a"]), var=pd.DataFrame({"c": [1]}, index=["x"])
     )
     a.raw = a.copy()
-    merged = ad.merge([a])
-    assert merged.raw is not None
-    assert merged.raw.X is None
+    a.X = np.ones((1, 1))
+    with pytest.raises(NotImplementedError, match=r"`\.raw` has no `X`"):
+        ad.merge([a])
 
 
-def test_outer_join_dask_integer():
+@pytest.mark.parametrize(
+    ("dtype", "fill_value", "expected_dtype"),
+    [
+        pytest.param(np.int64, None, np.float64, id="int-nan"),
+        pytest.param(np.int64, -1, np.int64, id="int-neg"),
+        pytest.param(np.uint8, -1, np.int16, id="uint8-neg"),
+        pytest.param(np.int8, 1000, np.int32, id="int8-large"),
+        pytest.param(np.float32, 1e100, np.float64, id="float32-huge"),
+    ],
+)
+@pytest.mark.parametrize("as_sparse", [False, True], ids=["dense", "sparse"])
+def test_outer_join_dask_fill_dtype(dtype, fill_value, expected_dtype, as_sparse):
     da = pytest.importorskip("dask.array")
     var = pd.DataFrame(index=["x", "y"])
-    a = _empty(["a"], var.index, X=da.ones((1, 2), dtype=int))
+    x = da.ones((1, 2), dtype=dtype)
+    if as_sparse:
+        x = x.map_blocks(sparse.csr_matrix)
+    a = _empty(["a"], var.index, X=x)
     b = _empty(["b"], var.index)
-    merged = ad.merge([a, b], join="outer")
+    merged = ad.merge([a, b], join="outer", fill_value=fill_value)
     assert isinstance(merged.X, da.Array)
-    assert_equal(merged.X.compute(), np.array([[1.0, 1.0], [np.nan, np.nan]]))
-    filled = ad.merge([a, b], join="outer", fill_value=-1)
-    assert_equal(filled.X.compute(), np.array([[1, 1], [-1, -1]]))
+    computed = merged.X.compute()
+    if as_sparse and fill_value is None:
+        fill_value = 0
+    computed = np.asarray(computed.toarray() if sparse.issparse(computed) else computed)
+    if fill_value is None:
+        assert computed.dtype == expected_dtype
+        assert_equal(computed, np.array([[1.0, 1.0], [np.nan, np.nan]]))
+    else:
+        assert_equal(computed, np.array([[1, 1], [fill_value, fill_value]]))
+        assert np.array_equal(computed[1], [fill_value, fill_value])
+
+
+@pytest.mark.parametrize("strategy", ["unique", "same"])
+def test_equal_dask_and_sparse_x_is_order_independent(strategy):
+    da = pytest.importorskip("dask.array")
+    axes = (["a"], ["x"])
+    lazy = _empty(*axes, X=da.ones((1, 1)))
+    sp = _empty(*axes, X=sparse.csr_matrix([[1.0]]))
+    dense = _empty(*axes, X=np.ones((1, 1)))
+    lazy_sp = _empty(*axes, X=da.ones((1, 1)).map_blocks(sparse.csr_matrix))
+    for x, y in [(lazy, sp), (lazy, dense), (lazy_sp, dense), (lazy_sp, sp)]:
+        assert ad.merge([x, y], merge=strategy).X is not None
+        assert ad.merge([y, x], merge=strategy).X is not None
+    other = _empty(*axes, X=np.zeros((1, 1)))
+    assert ad.merge([lazy, other], merge=strategy).X is None
+    assert ad.merge([other, lazy], merge=strategy).X is None
+
+
+def test_awkward_layer_var_alignment():
+    ak = pytest.importorskip("awkward")
+    a = _empty(["s"], ["x", "y"], layers={"awk": ak.Array(np.array([[1, 2]]))})
+    b = _empty(["s"], ["y"])
+    assert ad.merge([a, b]).layers["awk"].to_list() == [[2]]
+    assert ad.merge([a, _empty(["s"], ["y", "x"])]).layers["awk"].to_list() == [[1, 2]]
+    assert ad.merge([_empty(["s"], ["y", "x"]), a]).layers["awk"].to_list() == [[2, 1]]
+    outer = ad.merge([a, _empty(["s"], ["z"])], join="outer")
+    assert list(outer.var_names) == ["x", "y", "z"]
+    assert outer.layers["awk"].to_list() == [[1, 2, None]]
+
+
+def test_view_of_dask_stays_lazy():
+    da = pytest.importorskip("dask.array")
+    computed = []
+    x = da.ones((4, 2)).map_blocks(lambda b: computed.append(1) or b)
+    a = _empty(list("abcd"), ["x", "y"], X=x)
+    computed.clear()
+    merged = ad.merge([a[:2], a[["b", "a"]]], merge="first")
+    assert isinstance(merged.X, da.Array)
+    assert computed == []
+    assert_equal(merged.X.compute(), np.ones((2, 2)))
 
 
 def test_outer_join_fill_value_scope():

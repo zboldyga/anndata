@@ -141,7 +141,7 @@ def equal_dataframe(a, b) -> bool:
 
 
 @equal.register(DaskArray)
-def equal_dask_array(a, b) -> bool:
+def equal_dask_array(a, b) -> bool:  # noqa: PLR0911
     import dask.array as da
     from dask.base import tokenize
 
@@ -151,7 +151,10 @@ def equal_dask_array(a, b) -> bool:
         return False
     if isinstance(b, DaskArray) and tokenize(a) == tokenize(b):
         return True
-    if isinstance(a._meta, np.ndarray):
+    if not isinstance(b, DaskArray):
+        # Compare in memory: `b` is not lazy, so `a` has to be loaded anyway
+        return equal(a.compute(), b)
+    if isinstance(a._meta, np.ndarray) and isinstance(b._meta, np.ndarray):
         return da.equal(a, b, where=~(da.isnan(a) & da.isnan(b))).all().compute()
     if a.chunksize == b.chunksize and isinstance(
         a._meta, CupySparseMatrix | CSMatrix | CSArray
@@ -210,7 +213,7 @@ def equal_sparse(a, b) -> bool:
             )
         )
         # fmt: on
-    elif isinstance(b, np.ndarray):
+    elif isinstance(b, np.ndarray | DaskArray):
         # Dense vs. sparse: compare values so the result does not depend on argument order
         return equal(b, a)
     else:
@@ -648,7 +651,12 @@ class Reindexer:
             # Promote e.g. integer arrays so that a `nan` fill value can be stored
             if (
                 np.isscalar(fill_value)
-                and (dtype := np.result_type(sub_el.dtype, fill_value)) != sub_el.dtype
+                and (
+                    dtype := np.result_type(
+                        sub_el.dtype, np.min_scalar_type(fill_value)
+                    )
+                )
+                != sub_el.dtype
             ):
                 sub_el = sub_el.astype(dtype)
             # TODO: Remove this condition once https://github.com/dask/dask/pull/12078 is released
@@ -805,18 +813,18 @@ class Reindexer:
 
         if self.no_change:
             return el
-        elif axis == 1:  # Indexing by field
+        elif axis == 1 and el.fields:  # Indexing by field
             if self.new_idx.isin(self.old_idx).all():  # inner join
                 return el[self.new_idx]
             else:  # outer join
                 # TODO: this code isn't actually hit, we should refactor
                 msg = "This should be unreachable, please open an issue."
                 raise Exception(msg)
-        else:
+        else:  # Positional indexing
             idx = self.idx
-            if (idx == -1).any():  # outer join: index -1 must map to a missing row
-                el = ak.pad_none(el, len(el) + 1, axis=axis)  # axis == 0
-            return el[idx]
+            if (idx == -1).any():  # outer join: index -1 must map to a missing entry
+                el = ak.pad_none(el, len(self.old_idx) + 1, axis=axis)
+            return el[:, idx] if axis == 1 else el[idx]
 
     @property
     def idx(self) -> NDArray[np.intp]:
@@ -1949,9 +1957,11 @@ def _merge_raw(
         warn(msg, UserWarning)
         return None
     (raw, reindexer), *_ = with_raw
-    raw_x = _load_if_backed(raw.X)
-    if raw_x is not None:
-        raw_x = reindexer(raw_x, axis=0, fill_value=fill_value)
+    if raw.X is None:
+        # `Raw(adata, X=None, ...)` takes `X`, `var` and `varm` from `adata` instead
+        msg = "Cannot merge an AnnData object whose `.raw` has no `X`."
+        raise NotImplementedError(msg)
+    raw_x = reindexer(_load_if_backed(raw.X), axis=0, fill_value=fill_value)
     return {"X": raw_x, "var": raw.var, "varm": dict(raw.varm)}
 
 
@@ -2007,8 +2017,8 @@ def merge(
         When `join="outer"`, this is the value that will be used to fill the introduced
         indices of `X`, `layers`, `obsm`, `varm`, `obsp`, `varp` and `raw.X`.
         By default, sparse arrays are padded with zeros, while dense arrays and
-        DataFrames are padded with missing values. Columns of `obs` and `var` are
-        always padded with missing values.
+        DataFrames are padded with missing values. Columns of `obs` and `var` and
+        :class:`~awkward.Array` elements are always padded with missing values.
 
     Notes
     -----
@@ -2020,6 +2030,7 @@ def merge(
 
     :attr:`~anndata.AnnData.raw` is kept only when exactly one object has it;
     otherwise a warning is emitted and the result has no `.raw`.
+    Merging an object whose `.raw` has no `X` is not supported.
 
     Examples
     --------
@@ -2073,7 +2084,10 @@ def merge(
     6.0
     """
     # Views are materialized so no element of the result writes through to a parent
-    adatas = [a.to_memory(copy=True) if a.is_view else a for a in adatas]
+    adatas = [
+        (a.to_memory(copy=True) if a.isbacked else a.copy()) if a.is_view else a
+        for a in adatas
+    ]
     if len(adatas) == 0:
         msg = "No objects to merge."
         raise ValueError(msg)
