@@ -1286,13 +1286,13 @@ def make_dask_col_from_extension_dtype(
     A :class:`dask.Array`: representation of the column.
     """
     import dask.array as da
+    import xarray as xr
 
     from anndata._io.specs.lazy_methods import (
         compute_chunk_layout_for_axis_size,
         get_chunksize,
         maybe_open_h5,
     )
-    from anndata.compat import xarray as xr
     from anndata.experimental import read_elem_lazy
 
     base_path_or_zarr_group: Path | zarr.Group | None = col.attrs.get(
@@ -1701,8 +1701,9 @@ def concat(  # noqa: PLR0912, PLR0913, PLR0915
     {'a': 1, 'b': 2, 'c': {'c.a': 3, 'c.b': 4, 'c.c': 5}}
     """
 
+    import xarray as xr
+
     from anndata._core.xarray import Dataset2D
-    from anndata.compat import xarray as xr
 
     # Argument normalization
     merge = resolve_merge_strategy(merge)

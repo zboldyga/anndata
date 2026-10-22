@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import weakref
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import reduce, singledispatch
-from importlib.util import find_spec
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -22,9 +22,11 @@ from ..compat import (
     CupyCSRMatrix,
     DaskArray,
     IndexManager,
+    XDataArray,
     ZappyArray,
     has_xp,
     has_xp_base,
+    lazy_type,
     pandas_no_chained_assignment_warning,
 )
 from ..utils import warn
@@ -196,39 +198,51 @@ class ArrayView(_SetItemMixin, np.ndarray):
         return self.copy()
 
 
-# Extends DaskArray
-# Calls parent __new__ constructor since
-# even calling astype on a dask array
-# needs a .compute() call to actually happen.
-# So no construction by view casting like ArrayView
-class DaskArrayView(_SetItemMixin, DaskArray):
-    def __new__(
-        cls,
-        input_array: DaskArray,
-        view_args: ViewArgs | None = None,
-    ):
-        arr = super().__new__(
+def _make_dask_array_view() -> type[DaskArray]:
+    import dask.array as da
+
+    # Extends DaskArray
+    # Calls parent __new__ constructor since
+    # even calling astype on a dask array
+    # needs a .compute() call to actually happen.
+    # So no construction by view casting like ArrayView
+    class DaskArrayView(_SetItemMixin, da.Array):
+        def __new__(
             cls,
-            dask=input_array.dask,
-            name=input_array.name,
-            chunks=input_array.chunks,
-            dtype=input_array.dtype,
-            meta=input_array._meta,
-            shape=input_array.shape,
-        )
-        if view_args is not None:
-            view_args = ElementRef(*view_args)
-        arr._view_args = view_args
+            input_array: DaskArray,
+            view_args: ViewArgs | None = None,
+        ):
+            arr = super().__new__(
+                cls,
+                dask=input_array.dask,
+                name=input_array.name,
+                chunks=input_array.chunks,
+                dtype=input_array.dtype,
+                meta=input_array._meta,
+                shape=input_array.shape,
+            )
+            if view_args is not None:
+                view_args = ElementRef(*view_args)
+            arr._view_args = view_args
 
-        return arr
+            return arr
 
-    def __array_finalize__(self, obj: DaskArray | None):
-        if obj is not None:
-            self._view_args = getattr(obj, "_view_args", None)
+        def __array_finalize__(self, obj: DaskArray | None):
+            if obj is not None:
+                self._view_args = getattr(obj, "_view_args", None)
 
-    def keys(self) -> tuple[str, ...]:
-        # it’s a structured array
-        return self.dtype.names or ()
+        def keys(self) -> tuple[str, ...]:
+            # it’s a structured array
+            return self.dtype.names or ()
+
+    return DaskArrayView
+
+
+# View classes deriving from optional dependencies are built on first use,
+# so that `import anndata` does not import dask, cupy, or awkward.
+DaskArrayView = lazy_type(
+    "dask.array", "DaskArrayView", factory=_make_dask_array_view, module_name=__name__
+)
 
 
 # Unlike array views, SparseCSRMatrixView and SparseCSCMatrixView
@@ -261,35 +275,63 @@ class SparseCSCArrayView(_ViewMixin, sparse.csc_array):
         return sparse.csc_array(self).copy()
 
 
-class CupySparseCSRView(_ViewMixin, CupyCSRMatrix):
-    def copy(self) -> CupyCSRMatrix:
-        return CupyCSRMatrix(self).copy()
+def _make_cupy_sparse_csr_view() -> type[CupyCSRMatrix]:
+    from cupyx.scipy.sparse import csr_matrix
+
+    class CupySparseCSRView(_ViewMixin, csr_matrix):
+        def copy(self) -> CupyCSRMatrix:
+            return csr_matrix(self).copy()
+
+    return CupySparseCSRView
 
 
-class CupySparseCSCView(_ViewMixin, CupyCSCMatrix):
-    def copy(self) -> CupyCSCMatrix:
-        return CupyCSCMatrix(self).copy()
+def _make_cupy_sparse_csc_view() -> type[CupyCSCMatrix]:
+    from cupyx.scipy.sparse import csc_matrix
+
+    class CupySparseCSCView(_ViewMixin, csc_matrix):
+        def copy(self) -> CupyCSCMatrix:
+            return csc_matrix(self).copy()
+
+    return CupySparseCSCView
 
 
-class CupyArrayView(_ViewMixin, CupyArray):
-    def __new__(
-        cls,
-        input_array: Sequence[Any],
-        view_args: ViewArgs | None = None,
-    ):
-        import cupy as cp
+def _make_cupy_array_view() -> type[CupyArray]:
+    import cupy as cp
 
-        arr = cp.asarray(input_array).view(type=cls)
+    class CupyArrayView(_ViewMixin, cp.ndarray):
+        def __new__(
+            cls,
+            input_array: Sequence[Any],
+            view_args: ViewArgs | None = None,
+        ):
+            arr = cp.asarray(input_array).view(type=cls)
 
-        if view_args is not None:
-            view_args = ElementRef(*view_args)
-        arr._view_args = view_args
-        return arr
+            if view_args is not None:
+                view_args = ElementRef(*view_args)
+            arr._view_args = view_args
+            return arr
 
-    def copy(self) -> CupyArray:
-        import cupy as cp
+        def copy(self) -> CupyArray:
+            return cp.array(self).copy()
 
-        return cp.array(self).copy()
+    return CupyArrayView
+
+
+CupySparseCSRView = lazy_type(
+    "cupyx.scipy.sparse",
+    "CupySparseCSRView",
+    factory=_make_cupy_sparse_csr_view,
+    module_name=__name__,
+)
+CupySparseCSCView = lazy_type(
+    "cupyx.scipy.sparse",
+    "CupySparseCSCView",
+    factory=_make_cupy_sparse_csc_view,
+    module_name=__name__,
+)
+CupyArrayView = lazy_type(
+    "cupy", "CupyArrayView", factory=_make_cupy_array_view, module_name=__name__
+)
 
 
 class DictView(_ViewMixin, dict):
@@ -409,16 +451,20 @@ def _(a: Dataset2D, view_args):
     return a
 
 
-if find_spec("awkward") or TYPE_CHECKING:
-    import weakref
+@as_view.register(XDataArray)
+def as_view_xdataarray(a: XDataArray, view_args):
+    return a
 
-    from ..compat import awkward as ak
 
-    # Registry to store weak references from AwkwardArrayViews to their parent AnnData container
-    _registry: weakref.WeakValueDictionary[int, AnnData] = weakref.WeakValueDictionary()
-    _PARAM_NAME = "_view_args"
+# Registry to store weak references from AwkwardArrayViews to their parent AnnData container
+_registry: weakref.WeakValueDictionary[int, AnnData] = weakref.WeakValueDictionary()
+_PARAM_NAME = "_view_args"
 
-    class AwkwardArrayView(_ViewMixin, AwkArray):
+
+def _make_awkward_array_view() -> type[AwkArray]:
+    import awkward as ak
+
+    class AwkwardArrayView(_ViewMixin, ak.Array):
         @property
         def _view_args(self):
             """Override _view_args to retrieve the values from awkward arrays parameters.
@@ -447,31 +493,41 @@ if find_spec("awkward") or TYPE_CHECKING:
             array = ak.with_parameter(array, "__list__", None)
             return array
 
-    @as_view.register(AwkArray)
-    def as_view_awkarray(array, view_args):
-        parent, attrname, keys = view_args
-        parent_key = f"target-{id(parent)}"
-        _registry[parent_key] = parent
-        # TODO: See https://github.com/scverse/anndata/pull/647#discussion_r963494798_ for more details and
-        # possible strategies to stack behaviors.
-        # A better solution might be based on xarray-style "attrs", once this is implemented
-        # https://github.com/scikit-hep/awkward/issues/1391#issuecomment-1412297114
-        if type(array).__name__ != "Array":
-            msg = (
-                "Cannot create a view of an awkward array with __array__ parameter. "
-                "Please open an issue in the AnnData repo and describe your use-case."
-            )
-            raise NotImplementedError(msg)
-        array = ak.with_parameter(array, _PARAM_NAME, (parent_key, attrname, keys))
-        array = ak.with_parameter(array, "__list__", "AwkwardArrayView")
-        return array
-
     ak.behavior["AwkwardArrayView"] = AwkwardArrayView
+    return AwkwardArrayView
 
-else:
 
-    class AwkwardArrayView:
-        pass
+AwkwardArrayView = lazy_type(
+    "awkward",
+    "AwkwardArrayView",
+    factory=_make_awkward_array_view,
+    module_name=__name__,
+)
+
+
+@as_view.register(AwkArray)
+def as_view_awkarray(array, view_args):
+    import awkward as ak
+
+    # make sure the `AwkwardArrayView` behavior is registered with awkward
+    AwkwardArrayView._lazy_require()
+
+    parent, attrname, keys = view_args
+    parent_key = f"target-{id(parent)}"
+    _registry[parent_key] = parent
+    # TODO: See https://github.com/scverse/anndata/pull/647#discussion_r963494798_ for more details and
+    # possible strategies to stack behaviors.
+    # A better solution might be based on xarray-style "attrs", once this is implemented
+    # https://github.com/scikit-hep/awkward/issues/1391#issuecomment-1412297114
+    if type(array).__name__ != "Array":
+        msg = (
+            "Cannot create a view of an awkward array with __array__ parameter. "
+            "Please open an issue in the AnnData repo and describe your use-case."
+        )
+        raise NotImplementedError(msg)
+    array = ak.with_parameter(array, _PARAM_NAME, (parent_key, attrname, keys))
+    array = ak.with_parameter(array, "__list__", "AwkwardArrayView")
+    return array
 
 
 def _resolve_idxs(

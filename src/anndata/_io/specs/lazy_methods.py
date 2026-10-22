@@ -263,9 +263,9 @@ def _gen_xarray_dict_iterator_from_elems(
     dim_name: str,
     index: pd.Index,
 ) -> Generator[tuple[str, XVariable]]:
-    from anndata.experimental.backed._lazy_arrays import CategoricalArray, MaskedArray
+    import xarray as xr
 
-    from ...compat import xarray as xr
+    from anndata.experimental.backed._lazy_arrays import CategoricalArray, MaskedArray
 
     for k, v in elem_dict.items():
         if isinstance(v, DaskArray) and k != dim_name:

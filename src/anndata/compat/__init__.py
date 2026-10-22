@@ -7,7 +7,6 @@ from enum import Enum, auto
 from functools import partial, singledispatch
 from importlib import import_module
 from importlib.metadata import version
-from importlib.util import find_spec
 from typing import TYPE_CHECKING, Protocol, cast, overload
 
 import h5py
@@ -20,9 +19,11 @@ from packaging.version import Version
 from anndata.types import SupportsArrayApi, SupportsArrayApiBase
 
 from .._warnings import warn
+from ._lazy import lazy_type
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
+    from types import ModuleType
     from typing import Any, Self, TypeAlias, TypeGuard, TypeIs
 
     import zarr
@@ -155,82 +156,70 @@ else:
 #############################
 
 
-if find_spec("awkward") or TYPE_CHECKING:
-    import awkward  # noqa: F401
+if TYPE_CHECKING:
     from awkward import Array as AwkArray
-else:
-
-    class AwkArray:
-        @staticmethod
-        def __repr__() -> str:
-            return "mock awkward.highlevel.Array"
-
-
-if find_spec("zappy") or TYPE_CHECKING:
-    from zappy.base import ZappyArray
-else:
-
-    class ZappyArray:
-        @staticmethod
-        def __repr__() -> str:
-            return "mock zappy.base.ZappyArray"
-
-
-if TYPE_CHECKING or find_spec("dask"):
+    from cupy import ndarray as CupyArray
+    from cupyx.scipy.sparse import csc_matrix as CupyCSCMatrix
+    from cupyx.scipy.sparse import csr_matrix as CupyCSRMatrix
+    from cupyx.scipy.sparse import spmatrix as CupySparseMatrix
     from dask.array import Array as DaskArray
-else:
-    DaskArray = type("Array", (), dict(__module__="dask.array"))
-
-
-if TYPE_CHECKING or find_spec("xarray"):
-    import xarray
     from xarray import DataArray as XDataArray
     from xarray import Dataset as XDataset
     from xarray import Variable as XVariable
     from xarray.backends import BackendArray as XBackendArray
     from xarray.backends.zarr import ZarrArrayWrapper as XZarrArrayWrapper
+    from zappy.base import ZappyArray
 else:
-    xarray = None
-    XDataArray = type("DataArray", (), dict(__module__="xarray"))
-    XDataset = type("Dataset", (), dict(__module__="xarray"))
-    XVariable = type("Variable", (), dict(__module__="xarray"))
-    XBackendArray = type("BackendArray", (), dict(__module__="xarray.backends"))
-    XZarrArrayWrapper = type(
-        "ZarrArrayWrapper", (), dict(__module__="xarray.backends.zarr")
+    # Placeholders that resolve to the real classes once their package is imported.
+    # See `anndata.compat._lazy` for their semantics.
+    AwkArray = lazy_type("awkward", "Array")
+    ZappyArray = lazy_type("zappy.base", "ZappyArray")
+    DaskArray = lazy_type("dask.array", "Array")
+    XDataArray = lazy_type("xarray", "DataArray")
+    XDataset = lazy_type("xarray", "Dataset")
+    XVariable = lazy_type("xarray", "Variable")
+    XBackendArray = lazy_type("xarray.backends", "BackendArray")
+    XZarrArrayWrapper = lazy_type("xarray.backends.zarr", "ZarrArrayWrapper")
+
+    def _register_cupy_dask_chunk_types(_: type) -> None:
+        """Allow dask arrays with cupy sparse chunks.
+
+        Runs once, when anndata first encounters a cupy object, as it needs cupy and dask.
+        """
+        try:
+            import dask.array as da
+            from cupyx.scipy.sparse import csc_matrix, csr_matrix
+        except ImportError:
+            return
+        da.register_chunk_type(csr_matrix)
+        da.register_chunk_type(csc_matrix)
+
+    CupyArray = lazy_type("cupy", "ndarray", on_resolve=_register_cupy_dask_chunk_types)
+    CupySparseMatrix = lazy_type(
+        "cupyx.scipy.sparse", "spmatrix", on_resolve=_register_cupy_dask_chunk_types
     )
-
-
-# https://github.com/scverse/anndata/issues/1749
-def is_cupy_importable() -> bool:
-    try:
-        import cupy  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-if is_cupy_importable() or TYPE_CHECKING:
-    from cupy import ndarray as CupyArray
-    from cupyx.scipy.sparse import csc_matrix as CupyCSCMatrix
-    from cupyx.scipy.sparse import csr_matrix as CupyCSRMatrix
-    from cupyx.scipy.sparse import spmatrix as CupySparseMatrix
-
-    try:
-        import dask.array as da
-    except ImportError:
-        pass
-    else:
-        da.register_chunk_type(CupyCSRMatrix)
-        da.register_chunk_type(CupyCSCMatrix)
-else:
-    CupyArray = type("ndarray", (), dict(__module__="cupy"))
-    CupySparseMatrix = type("spmatrix", (), dict(__module__="cupyx.scipy.sparse"))
-    CupyCSRMatrix = type("csr_matrix", (), dict(__module__="cupyx.scipy.sparse"))
-    CupyCSCMatrix = type("csc_matrix", (), dict(__module__="cupyx.scipy.sparse"))
+    CupyCSRMatrix = lazy_type(
+        "cupyx.scipy.sparse", "csr_matrix", on_resolve=_register_cupy_dask_chunk_types
+    )
+    CupyCSCMatrix = lazy_type(
+        "cupyx.scipy.sparse", "csc_matrix", on_resolve=_register_cupy_dask_chunk_types
+    )
 
 
 # no `type` keyword so `isinstance` checking works
 CupyCSMatrix: TypeAlias = CupyCSCMatrix | CupyCSRMatrix  # noqa: UP040
+
+
+def __getattr__(name: str) -> ModuleType | None:
+    """Backwards compatibility: `anndata.compat.{awkward,xarray}` were modules or `None`."""
+    if name in {"awkward", "xarray"}:
+        try:
+            return import_module(name)
+        except ImportError:
+            return None
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
+
 
 old_positionals = partial(legacy_api, category=FutureWarning)
 

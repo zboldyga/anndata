@@ -274,8 +274,9 @@ def test_assign_X(adata):
     adata_copy = adata.copy()
 
     adata.X = -1 * da.ones(adata.X.shape)
-    assert prev_type is DaskArray
-    assert type(adata_copy.X) is DaskArray
+    assert prev_type is da.Array
+    assert isinstance(adata_copy.X, DaskArray)
+    assert type(adata_copy.X) is da.Array
     assert_equal(adata.X, -1 * np.ones(adata.X.shape))
     assert_equal(adata_copy.X, np.ones(adata.X.shape))
 

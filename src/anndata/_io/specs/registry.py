@@ -14,6 +14,7 @@ from anndata._io.utils import report_read_key_on_error, report_write_key_on_erro
 from anndata._settings import settings
 from anndata._types import Read, ReadLazy, _ReadInternal, _ReadLazyInternal
 from anndata.compat import DaskArray, _read_attr, has_xp
+from anndata.compat._lazy import lazy_type_for
 
 from ...utils import warn
 
@@ -231,15 +232,19 @@ class IORegistry[RI: (_ReadInternal, _ReadLazyInternal), R: (Read, ReadLazy)]:
         raise IORegistryError._from_read_parts(name, self.read_partial, src_type, spec)
 
     def get_spec(self, elem: StorageType) -> IOSpec:
+        # specs for optional types are registered using their lazy placeholders
+        t = lazy_type_for(type(elem))
         if isinstance(elem, DaskArray):
-            if (typ_meta := (DaskArray, type(elem._meta))) in self.write_specs:
+            if (
+                typ_meta := (DaskArray, lazy_type_for(type(elem._meta)))
+            ) in self.write_specs:
                 return self.write_specs[typ_meta]
         elif (
             hasattr(elem, "dtype")
-            and (typ_kind := (type(elem), elem.dtype.kind)) in self.write_specs
+            and (typ_kind := (t, elem.dtype.kind)) in self.write_specs
         ):
             return self.write_specs[typ_kind]
-        return self.write_specs[type(elem)]
+        return self.write_specs[t]
 
 
 _REGISTRY: IORegistry[_ReadInternal, Read] = IORegistry()
@@ -270,13 +275,13 @@ def get_spec(elem: StorageType) -> IOSpec:
 
 def _iter_patterns(elem: RWAble) -> Generator[WriteSrcType]:
     """Iterates over possible patterns for an element in order of precedence."""
-    from anndata.compat import DaskArray
-
-    t = type(elem)
+    # specs for optional types are registered using their lazy placeholders
+    t = lazy_type_for(type(elem))
 
     if isinstance(elem, DaskArray):
-        yield (t, type(elem._meta), elem.dtype.kind)
-        yield (t, type(elem._meta))
+        meta_t = lazy_type_for(type(elem._meta))
+        yield (t, meta_t, elem.dtype.kind)
+        yield (t, meta_t)
     # Array API dtypes don’t have guaranteed attributes
     if isinstance(elem, np.ndarray):
         yield (t, elem.dtype.kind)

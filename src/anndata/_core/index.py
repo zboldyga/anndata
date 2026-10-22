@@ -494,6 +494,13 @@ def _subset_dataset2d(ds: Dataset2D, subset_idx: NumpySubsetIdx) -> Dataset2D:
     return ds.iloc[subset_idx]
 
 
+@_subset_dispatch.register(XDataArray)
+def _subset_xdataarray(
+    a: XDataArray, subset_idx: tuple[_Index1DNorm] | tuple[_Index1DNorm, _Index1DNorm]
+):
+    return a[subset_idx]
+
+
 @_subset_dispatch.register(AwkArray)
 @_ensure_numpy_idx
 def _subset_awkarray(a: AwkArray, subset_idx: NumpySubsetIdx) -> AwkArray:
