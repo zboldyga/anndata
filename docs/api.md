@@ -169,6 +169,17 @@ Out of core concatenation
    experimental.concat_on_disk
 ```
 
+Moving values between {attr}`~anndata.AnnData.X` and the axis annotations
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+
+   experimental.move_to_obs
+   experimental.move_to_var
+   experimental.move_to_x
+```
+
 Low level methods for reading and writing elements of an {class}`AnnData` object to a store:
 
 ```{eval-rst}

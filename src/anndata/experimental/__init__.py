@@ -14,6 +14,7 @@ from .._types import (
 )
 from ..utils import module_get_attr_redirect
 from ._dispatch_io import read_dispatched, write_dispatched
+from ._move import move_to_obs, move_to_var, move_to_x
 from .backed import read_lazy
 from .merge import concat_on_disk
 from .multi_files import AnnCollection, AnnCollectionView
@@ -60,6 +61,9 @@ __all__ = [
     "Write",
     "WriteCallback",
     "concat_on_disk",
+    "move_to_obs",
+    "move_to_var",
+    "move_to_x",
     "read_dispatched",
     "read_elem_lazy",
     "read_lazy",
