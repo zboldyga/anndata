@@ -434,14 +434,25 @@ def test_move_to_x_does_not_share_memory(*, as_view: bool):
     adata.raw = adata.copy()
     orig = adata.copy()
     inp = adata[:4, :3] if as_view else adata
+    inp_raw = inp.raw
+    assert inp_raw is not None
+    raw_varm_before = {k: np.array(v) for k, v in inp_raw.varm.items()}
+    raw_x_before = np.array(asarray(inp_raw.X))
     res = move_to_x(inp, "float64")
     _assert_no_shared_memory(res, adata)
     _poke(res.obsm["array"])
     _poke(res.obsp["p"])
     _poke(res.varm["array"])
     assert res.raw is not None
-    _poke(res.raw.varm["array"])
+    for k, v in res.raw.varm.items():
+        assert not shares_memory(v, inp_raw.varm[k])
+        _poke(v)
+    assert not shares_memory(res.raw.X, inp_raw.X)
+    _poke(res.raw.X)
     assert_equal(adata, orig)
+    for k, v in raw_varm_before.items():
+        np.testing.assert_array_equal(inp_raw.varm[k], v)
+    np.testing.assert_array_equal(asarray(inp_raw.X), raw_x_before)
     res_var = move_to_x(inp, "float64", source="var")
     _assert_no_shared_memory(res_var, adata)
     _poke(res_var.varm["array"])
@@ -560,3 +571,26 @@ def test_move_to_x_validation_of_labels():
     adata.obs = pd.DataFrame({"c": np.ones(5, dtype=complex)}, index=adata.obs_names)
     with pytest.raises(ValueError, match="Only real numeric or boolean"):
         move_to_x(adata, "c")
+
+
+@pytest.mark.parametrize("source", ["obs", "var"])
+def test_move_to_x_keeps_nd_mappings(source):
+    adata = gen_adata((5, 4), obsm_types=(), varm_types=())
+    adata.varm["tensor"] = np.arange(16).reshape(4, 2, 2)
+    adata.obsm["tensor"] = np.arange(20.0).reshape(5, 2, 2)
+    res = move_to_x(adata, "float64", source=source)
+    grown, kept = ("varm", "obsm") if source == "obs" else ("obsm", "varm")
+    grown_arr = getattr(res, grown)["tensor"]
+    kept_arr = getattr(res, kept)["tensor"]
+    assert grown_arr.shape == (getattr(adata, grown)["tensor"].shape[0] + 1, 2, 2)
+    np.testing.assert_array_equal(grown_arr[:-1], getattr(adata, grown)["tensor"])
+    assert np.isnan(grown_arr[-1]).all()
+    np.testing.assert_array_equal(kept_arr, getattr(adata, kept)["tensor"])
+
+
+def test_move_to_x_awkward_source_rejected():
+    ak = pytest.importorskip("awkward")
+    adata = gen_adata((5, 3), obsm_types=(), varm_types=())
+    adata.obsm["awk"] = ak.Array(np.ones((5, 2)))
+    with pytest.raises(TypeError, match="awkward array"):
+        move_to_x(adata, "awk", source="obsm")

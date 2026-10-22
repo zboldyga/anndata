@@ -14,6 +14,7 @@ from pandas.api.types import is_bool_dtype, is_complex_dtype, is_numeric_dtype
 from .._core.anndata import AnnData
 from .._core.merge import _resolve_axis, concat
 from .._warnings import warn
+from ..compat import AwkArray
 from ..utils import asarray
 
 if TYPE_CHECKING:
@@ -230,6 +231,7 @@ def move_to_var(
     Returns
     -------
     A new :class:`~anndata.AnnData` with ``n_obs`` reduced by the number of moved observations.
+    The object must be in memory (not backed).
     If ``adata.raw`` is set, it is subset along with ``X``.
 
     See Also
@@ -254,6 +256,12 @@ def _values_from_mapping(
         if isinstance(df.columns, pd.CategoricalIndex):
             df = df.set_axis(pd.Index(df.columns.astype(object)), axis=1)
     else:
+        if isinstance(elem, AwkArray):
+            msg = (
+                f"`{mapping_name}[{key!r}]` is an awkward array, which cannot be moved to X; "
+                "supported sources are DataFrames, dense arrays and sparse matrices."
+            )
+            raise TypeError(msg)
         try:
             arr = asarray(elem)
         except Exception as e:
@@ -436,12 +444,20 @@ def move_to_x(
     new_annot = pd.DataFrame(index=pd.Index(values.columns, name=grow_names.name))
     # Both objects get the same aligned-axis elements, so `merge="first"` keeps them.
     aligned_pairwise = dict(getattr(src, f"{aligned_axis_name}p"))
+    # `concat` pads missing 2-D elements of the grown axis' mapping, but not n-D ones.
+    n_new = new_x.shape[grow_axis]
+    grow_padding = {
+        k: np.full((n_new, *v.shape[1:]), np.nan)
+        for k, v in getattr(src, f"{grow_axis_name}m").items()
+        if isinstance(v, np.ndarray) and v.ndim > 2
+    }
     if aligned_axis == 0:
         new = AnnData(
             X=new_x,
             obs=rest_annot,
             var=new_annot,
             obsm=rest_mapping,
+            varm=grow_padding,
             obsp=aligned_pairwise,
         )
         base = AnnData(
@@ -459,6 +475,7 @@ def move_to_x(
             X=new_x,
             obs=new_annot,
             var=rest_annot,
+            obsm=grow_padding,
             varm=rest_mapping,
             varp=aligned_pairwise,
         )
@@ -485,7 +502,8 @@ def move_to_x(
     result.uns = src.uns
     if src.raw is not None:
         if aligned_axis == 0:
-            result.raw = src.raw.to_adata()
+            # `Raw.copy` shares `varm` buffers; `AnnData.copy` copies every element.
+            result.raw = src.raw.to_adata().copy()
         else:
             msg = "Moving values to new observations drops `.raw`, as it has no values for them."
             warn(msg, UserWarning)
