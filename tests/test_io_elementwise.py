@@ -750,8 +750,26 @@ def test_write_nullable_string(
         assert store["el"].attrs["encoding-type"] == expected
 
 
-def test_write_spec_keeps_attrs_set_by_writer(store: _GroupStorageType):
-    """The ``write_spec`` wrapper must not overwrite attributes the writer itself set."""
+@pytest.mark.parametrize("fmt", ["h5ad", "zarr-v2", "zarr-v3"])
+@pytest.mark.parametrize(
+    "preset",
+    [
+        frozenset(),
+        {"encoding-type"},
+        {"encoding-version"},
+        {"encoding-type", "encoding-version"},
+    ],
+)
+def test_write_spec_keeps_attrs_set_by_writer(
+    tmp_path: Path, fmt: str, preset: frozenset[str]
+):
+    """The ``write_spec`` wrapper only adds missing encoding attrs, never touching existing ones."""
+    store: h5py.Group | zarr.Group
+    if fmt == "h5ad":
+        store = h5py.File(tmp_path / "test.h5ad", "w")["/"]
+    else:
+        zarr_format: Literal[2, 3] = 2 if fmt == "zarr-v2" else 3
+        store = zarr.open_group(MemoryStore(), mode="w", zarr_format=zarr_format)
     registry = IORegistry()
     spec = IOSpec("custom", "9.9.9")
 
@@ -759,13 +777,22 @@ def test_write_spec_keeps_attrs_set_by_writer(store: _GroupStorageType):
     @registry.register_write(zarr.Group, np.ndarray, spec)
     def write_custom(f, k, elem, *, _writer, dataset_kwargs):
         write_elem(f, k, elem)  # sets encoding-type "array" and its version
-        f[k].attrs["extra"] = "kept"
+        attrs = f[k].attrs
+        for name in {"encoding-type", "encoding-version"} - preset:
+            del attrs[name]
+        attrs["extra"] = "kept"
 
     Writer(registry).write_elem(store, "el", np.arange(3))
 
-    assert _read_attr(store["el"].attrs, "encoding-type") == "array"
-    assert _read_attr(store["el"].attrs, "encoding-version") != spec.encoding_version
-    assert _read_attr(store["el"].attrs, "extra") == "kept"
+    attrs = store["el"].attrs
+    expected = {"encoding-type": "array", "encoding-version": "0.2.0"}
+    for name in ("encoding-type", "encoding-version"):
+        got = _read_attr(attrs, name)
+        if name in preset:
+            assert got == expected[name]
+        else:
+            assert got == getattr(spec, name.replace("-", "_"))
+    assert _read_attr(attrs, "extra") == "kept"
 
 
 def test_many_small_elems_roundtrip(store: _GroupStorageType):

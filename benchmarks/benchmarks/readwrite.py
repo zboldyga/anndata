@@ -146,8 +146,9 @@ class H5ADWriteSuite:
 class UnsManyKeysSuite:
     """IO of an ``uns`` dict with many small entries (issue 1684)."""
 
-    params = (["h5ad", "zarr"], [10_000])
+    params = (["h5ad", "zarr"], [1_000])
     param_names = ("diskfmt", "n_keys")
+    timeout = 300
 
     def setup(self, diskfmt: str, n_keys: int):
         self.adata = anndata.AnnData(

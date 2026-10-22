@@ -97,8 +97,8 @@ def _set_missing_attrs(node: StorageType, attrs_to_set: Mapping[str, str]) -> No
     """\
     Set attributes on a node without overwriting existing ones (``setdefault`` semantics).
 
-    Done with a single attribute-manager access and a single metadata write:
-    for zarr, every ``attrs[k] = v`` rewrites the node’s metadata document,
+    Done with a single attribute-manager access and a single metadata update:
+    for zarr, every ``attrs[k] = v`` rewrites the node’s metadata document(s),
     which dominates the cost of writing many small elements (see issue 1684).
     """
     attrs = node.attrs
