@@ -155,7 +155,7 @@ def equal_dask_array(a, b) -> bool:  # noqa: PLR0911
         # Compare in memory: `b` is not lazy, so `a` has to be loaded anyway
         return equal(a.compute(), b)
     if isinstance(a._meta, np.ndarray) and isinstance(b._meta, np.ndarray):
-        return da.equal(a, b, where=~(da.isnan(a) & da.isnan(b))).all().compute()
+        return (da.equal(a, b) | (da.isnan(a) & da.isnan(b))).all().compute()
     if a.chunksize == b.chunksize and isinstance(
         a._meta, CupySparseMatrix | CSMatrix | CSArray
     ):
@@ -615,10 +615,11 @@ class Reindexer:
 
         indexer = self.idx
         is_outer = any(indexer == -1)
+        is_sparse_sub = isinstance(el._meta, CSArray | CSMatrix)
         # Fast path for the majority of sparse matrices whose minor-axis is unchunked and is being reindexed.
         # This prevents 0's from being stored explicitly in the sparse matrices when outer joining, for example (see below).
         if (
-            is_sparse_sub := isinstance(el._meta, CSArray | CSMatrix)
+            is_sparse_sub
             and el.chunksize[minor_axis := int(el._meta.format == "csr")]
             == el.shape[minor_axis]
             and axis == minor_axis
@@ -649,20 +650,25 @@ class Reindexer:
 
         if is_outer:
             # Promote e.g. integer arrays so that a `nan` fill value can be stored
-            if (
-                np.isscalar(fill_value)
-                and (
-                    dtype := np.result_type(
-                        sub_el.dtype, np.min_scalar_type(fill_value)
-                    )
+            if np.isscalar(fill_value):
+                # Preserve scalar-kind promotion before applying the value-range
+                # guard: min_scalar_type alone can underflow floating fills.
+                dtype = np.result_type(
+                    np.result_type(sub_el.dtype, fill_value),
+                    np.min_scalar_type(fill_value),
                 )
-                != sub_el.dtype
-            ):
-                sub_el = sub_el.astype(dtype)
+                # SciPy sparse cannot represent float16, even for small fills.
+                if is_sparse_sub and dtype == np.float16:
+                    dtype = np.dtype(np.float32)
+                if dtype != sub_el.dtype:
+                    sub_el = sub_el.astype(dtype)
             # TODO: Remove this condition once https://github.com/dask/dask/pull/12078 is released
-            if is_sparse_sub and np.isscalar(fill_value):
-                fill_value = np.array([[fill_value]])
-            sub_el[make_slice(indexer == -1, axis, len(shape))] = fill_value
+            fill = (
+                np.array([[fill_value]])
+                if is_sparse_sub and np.isscalar(fill_value)
+                else fill_value
+            )
+            sub_el[make_slice(indexer == -1, axis, len(shape))] = fill
 
         return sub_el
 
@@ -1957,10 +1963,6 @@ def _merge_raw(
         warn(msg, UserWarning)
         return None
     (raw, reindexer), *_ = with_raw
-    if raw.X is None:
-        # `Raw(adata, X=None, ...)` takes `X`, `var` and `varm` from `adata` instead
-        msg = "Cannot merge an AnnData object whose `.raw` has no `X`."
-        raise NotImplementedError(msg)
     raw_x = reindexer(_load_if_backed(raw.X), axis=0, fill_value=fill_value)
     return {"X": raw_x, "var": raw.var, "varm": dict(raw.varm)}
 
@@ -2029,7 +2031,7 @@ def merge(
     are loaded.
 
     :attr:`~anndata.AnnData.raw` is kept only when exactly one object has it;
-    otherwise a warning is emitted and the result has no `.raw`.
+    if several objects have it, a warning is emitted and the result has no `.raw`.
     Merging an object whose `.raw` has no `X` is not supported.
 
     Examples
@@ -2083,6 +2085,14 @@ def merge(
     >>> float(ad.merge([a, b], merge="first").obsm["X_umap"].sum())
     6.0
     """
+    adatas = list(adatas)
+    raws = [a.raw for a in adatas if a.raw is not None]
+    if len(raws) == 1 and raws[0].X is None:
+        # Validate before copying views: `Raw(adata, X=None, ...)` takes `X`,
+        # `var` and `varm` from `adata` instead, silently fabricating raw data.
+        msg = "Cannot merge an AnnData object whose `.raw` has no `X`."
+        raise NotImplementedError(msg)
+
     # Views are materialized so no element of the result writes through to a parent
     adatas = [
         (a.to_memory(copy=True) if a.isbacked else a.copy()) if a.is_view else a
@@ -2122,9 +2132,14 @@ def merge(
 
         def reindex(el, obs_r: Reindexer, var_r: Reindexer):
             el = _load_if_backed(el)
+            # Empty sparse Dask arrays can become dense after one reindexing;
+            # preserve the original element's default fill across both axes.
+            element_fill_value = (
+                default_fill_value([el]) if fill_value is None else fill_value
+            )
             for axis_name, el_axis in axes:
                 r = obs_r if axis_name == "obs" else var_r
-                el = r(el, axis=el_axis, fill_value=fill_value)
+                el = r(el, axis=el_axis, fill_value=element_fill_value)
             return el
 
         return merge([

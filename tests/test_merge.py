@@ -379,12 +379,19 @@ def test_equal_dense_and_sparse_x_is_order_independent(strategy):
     assert ad.merge([other, sp], merge=strategy).X is None
 
 
-def test_raw_without_x():
+@pytest.mark.parametrize("as_view", [False, True], ids=["actual", "view"])
+def test_raw_without_x(as_view):
     a = AnnData(
         obs=pd.DataFrame(index=["a"]), var=pd.DataFrame({"c": [1]}, index=["x"])
     )
     a.raw = a.copy()
+    view = a[:]
     a.X = np.ones((1, 1))
+    if as_view:
+        # Build the view before setting X: slicing itself has the same Raw
+        # constructor limitation, so a later slice would already fabricate X.
+        a = view
+    assert a.raw.X is None
     with pytest.raises(NotImplementedError, match=r"`\.raw` has no `X`"):
         ad.merge([a])
 
@@ -397,6 +404,10 @@ def test_raw_without_x():
         pytest.param(np.uint8, -1, np.int16, id="uint8-neg"),
         pytest.param(np.int8, 1000, np.int32, id="int8-large"),
         pytest.param(np.float32, 1e100, np.float64, id="float32-huge"),
+        pytest.param(np.uint8, 0.1, np.float64, id="uint8-fractional"),
+        pytest.param(np.uint8, 1e-8, np.float64, id="uint8-small"),
+        pytest.param(np.uint8, 1e-50, np.float64, id="uint8-tiny"),
+        pytest.param(np.uint8, np.float32(0.1), np.float32, id="uint8-float32"),
     ],
 )
 @pytest.mark.parametrize("as_sparse", [False, True], ids=["dense", "sparse"])
@@ -422,6 +433,8 @@ def test_outer_join_dask_fill_dtype(dtype, fill_value, expected_dtype, as_sparse
         assert_equal(computed, np.array([[1.0, 1.0], [np.nan, np.nan]]))
     else:
         assert_equal(computed, np.array([[1, 1], [fill_value, fill_value]]))
+        # Compare Python floats: NumPy's weak scalar promotion can hide underflow.
+        assert float(computed[1, 0]) == float(fill_value)
 
 
 @pytest.mark.parametrize("strategy", ["unique", "same"])
@@ -491,9 +504,9 @@ def test_lazy_annotations(load_annotation_index):
     from anndata.experimental import read_lazy
 
     eager = AnnData(
-        X=np.ones((2, 1)),
+        X=np.arange(4, dtype=float).reshape(2, 2),
         obs=pd.DataFrame({"score": [10, 20]}, index=["a", "b"]),
-        var=pd.DataFrame({"v": [1]}, index=["x"]),
+        var=pd.DataFrame({"v": [1, 2]}, index=["x", "y"]),
     )
     store = zarr.storage.MemoryStore()
     eager.write_zarr(store)
@@ -501,10 +514,102 @@ def test_lazy_annotations(load_annotation_index):
 
     for merged in (ad.merge([lazy]), ad.merge([eager, lazy]), ad.merge([lazy, eager])):
         assert list(merged.obs_names) == ["a", "b"]
-        assert list(merged.var_names) == ["x"]
+        assert list(merged.var_names) == ["x", "y"]
         assert list(merged.obs["score"]) == [10, 20]
-        assert list(merged.var["v"]) == [1]
-    # positional views of lazy objects
-    merged = ad.merge([eager, lazy[1:]])
-    assert list(merged.obs_names) == ["b"]
-    assert list(merged.obs["score"]) == [20]
+        assert list(merged.var["v"]) == [1, 2]
+        assert_equal(merged.X, eager.X)
+    # Positional views align both axes and their values, in either input order.
+    for idx in [(slice(1, None), slice(1, None)), ([1, 0], [1, 0])]:
+        for inputs in ([eager, lazy[idx]], [lazy[idx], eager]):
+            merged = ad.merge(inputs)
+            expected = eager[merged.obs_names, merged.var_names].copy()
+            assert_equal(merged, expected)
+
+
+@pytest.mark.parametrize("combine", [ad.merge, ad.concat], ids=["merge", "concat"])
+@pytest.mark.parametrize("strategy", ["same", "unique"])
+@pytest.mark.parametrize("mismatch", [None, "nan", "value"])
+def test_dask_nan_conflicts(combine, strategy, mismatch, monkeypatch):
+    da = pytest.importorskip("dask.array")
+    original_equal = da.equal
+
+    def initialized_equal(a, b, **kwargs):
+        # Masked-out ufunc positions may contain any value without an `out`.
+        # Initialize them to False to expose reliance on allocator contents.
+        if "where" in kwargs and "out" not in kwargs:
+            kwargs["out"] = da.zeros_like(a, dtype=bool)
+        return original_equal(a, b, **kwargs)
+
+    monkeypatch.setattr(da, "equal", initialized_equal)
+    values = np.array([[np.nan, 1.0], [2.0, np.nan]])
+    other = values.copy()
+    if mismatch == "nan":
+        other[0, 0] = 3.0
+    elif mismatch == "value":
+        other[0, 1] = 3.0
+    # Different chunks create different graphs, bypassing token equality.
+    left = da.from_array(values, chunks=(1, 2))
+    right = da.from_array(other, chunks=(2, 1))
+    a = AnnData(X=left, varm={"m": left})
+    b = AnnData(X=right, varm={"m": right})
+    b.obs_names = ["c", "d"] if combine is ad.concat else a.obs_names
+    result = combine([a, b], merge=strategy)
+    assert ("m" in result.varm) == (mismatch is None)
+    if mismatch is None:
+        assert_equal(result.varm["m"].compute(), values)
+    if combine is ad.merge:
+        assert (result.X is not None) == (mismatch is None)
+        if mismatch is None:
+            assert_equal(result.X.compute(), values)
+
+
+@pytest.mark.parametrize("combine", [ad.merge, ad.concat], ids=["merge", "concat"])
+@pytest.mark.parametrize("axis", [0, 1], ids=["align-obs", "align-var"])
+@pytest.mark.parametrize("sparse_type", [sparse.csr_matrix, sparse.csc_matrix])
+@pytest.mark.parametrize("fill_value", [1.0, 0.5, np.nan, np.inf])
+def test_sparse_dask_floating_fill(combine, axis, sparse_type, fill_value):
+    da = pytest.importorskip("dask.array")
+    x = da.from_array(sparse_type([[1]], dtype=np.uint8), chunks=(1, 1))
+    a = AnnData(
+        X=x,
+        obs=pd.DataFrame(index=["a"]),
+        var=pd.DataFrame(index=["x"]),
+    )
+    if combine is ad.merge:
+        b = AnnData(
+            obs=pd.DataFrame(index=["b" if axis == 0 else "a"]),
+            var=pd.DataFrame(index=["y" if axis == 1 else "x"]),
+        )
+        result = combine([a, b], join="outer", fill_value=fill_value)
+        expected = np.full((2, 1) if axis == 0 else (1, 2), fill_value)
+        expected[0, 0] = 1
+    else:
+        b = AnnData(
+            X=x,
+            obs=pd.DataFrame(index=["b"]),
+            var=pd.DataFrame(index=["y"]),
+        )
+        result = combine([a, b], axis=1 - axis, join="outer", fill_value=fill_value)
+        expected = np.array([[1, fill_value], [fill_value, 1]])
+    assert isinstance(result.X, da.Array)
+    actual = result.X.compute()
+    assert sparse.issparse(actual)
+    assert_equal(actual.toarray(), expected)
+
+
+@pytest.mark.parametrize("shape", [(0, 1), (1, 0), (0, 0)])
+@pytest.mark.parametrize("sparse_type", [sparse.csr_matrix, sparse.csc_matrix])
+def test_outer_join_empty_sparse_dask_preserves_default_fill(shape, sparse_type):
+    da = pytest.importorskip("dask.array")
+    a = AnnData(
+        X=da.from_array(sparse_type(shape, dtype=np.uint8), chunks=(1, 1)),
+        obs=pd.DataFrame(index=["a"][: shape[0]]),
+        var=pd.DataFrame(index=["x"][: shape[1]]),
+    )
+    b = _empty(["a", "b"], ["x", "y"])
+    result = ad.merge([a, b], join="outer")
+    assert isinstance(result.X, da.Array)
+    values = result.X.compute()
+    if sparse.issparse(values):
+        values = values.toarray()
+    assert_equal(values, np.zeros((2, 2)))
