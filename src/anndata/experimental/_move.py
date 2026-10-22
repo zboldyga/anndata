@@ -5,16 +5,16 @@ See https://github.com/scverse/anndata/issues/655
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_bool_dtype, is_numeric_dtype
+from pandas.api.types import is_bool_dtype, is_complex_dtype, is_numeric_dtype
 
 from .._core.anndata import AnnData
 from .._core.merge import _resolve_axis, concat
 from .._warnings import warn
+from ..utils import asarray
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -52,12 +52,11 @@ def _resolve_axis_mask(
     """Resolve `keys` (names or boolean mask over `axis`) to a mask and the names."""
     axis_name = "obs" if axis == 0 else "var"
     names: pd.Index = getattr(adata, f"{axis_name}_names")
-    if not isinstance(keys, str) and getattr(keys, "dtype", None) is not None:
-        mask = np.asarray(keys)
-        if mask.dtype != bool or mask.shape != (adata.shape[axis],):
+    if not isinstance(keys, str) and (mask := np.asarray(keys)).dtype == bool:
+        if mask.shape != (adata.shape[axis],):
             msg = (
                 f"Boolean mask for `{axis_name}` must have shape ({adata.shape[axis]},), "
-                f"got dtype {mask.dtype} and shape {mask.shape}."
+                f"got shape {mask.shape}."
             )
             raise ValueError(msg)
         if not mask.any():
@@ -168,6 +167,7 @@ def move_to_obs(
     Returns
     -------
     A new :class:`~anndata.AnnData` with ``n_vars`` reduced by the number of moved variables.
+    The object must be in memory (not backed).
 
     See Also
     --------
@@ -255,7 +255,7 @@ def _values_from_mapping(
             df = df.set_axis(pd.Index(df.columns.astype(object)), axis=1)
     else:
         try:
-            arr = np.asarray(elem)
+            arr = asarray(elem)
         except Exception as e:
             msg = (
                 f"`{mapping_name}[{key!r}]` of type {type(elem)} cannot be moved to X."
@@ -269,11 +269,14 @@ def _values_from_mapping(
             index=getattr(adata, f"{axis_name}_names"),
             columns=[f"{key}{i}" for i in range(arr.shape[1])],
         )
-    if not df.columns.is_unique:
-        msg = f"Columns of `{mapping_name}[{key!r}]` must be unique."
-        raise ValueError(msg)
     if any(not isinstance(c, str) for c in df.columns):
         df = df.set_axis(df.columns.astype(str), axis=1)
+    if df.shape[1] == 0:
+        msg = f"`{mapping_name}[{key!r}]` has no columns to move."
+        raise ValueError(msg)
+    if not df.columns.is_unique:
+        msg = f"Columns of `{mapping_name}[{key!r}]` must be unique (as strings)."
+        raise ValueError(msg)
     rest_mapping = {k: v for k, v in mapping.items() if k != key}
     return df, rest_mapping
 
@@ -286,10 +289,10 @@ def _to_numeric_array(df: pd.DataFrame, where: str) -> np.ndarray:
     if bad := [
         c
         for c, dt in df.dtypes.items()
-        if not (is_numeric_dtype(dt) or is_bool_dtype(dt))
+        if not (is_numeric_dtype(dt) or is_bool_dtype(dt)) or is_complex_dtype(dt)
     ]:
         msg = (
-            f"Only numeric or boolean values can be moved to X, "
+            f"Only real numeric or boolean values can be moved to X, "
             f"but {where} column(s) {bad!r} have dtype(s) {[str(df[c].dtype) for c in bad]!r}."
         )
         raise ValueError(msg)
@@ -331,8 +334,12 @@ def _resolve_source(
         if missing := [k for k in names if k not in aligned_annot.columns]:
             msg = f"Columns {missing!r} not found in `{source}`."
             raise KeyError(msg)
+        values = aligned_annot[names]
+        if not values.columns.is_unique:
+            msg = f"Column labels of `{source}` are not unique: {names!r} is ambiguous."
+            raise ValueError(msg)
         return (
-            aligned_annot[names],
+            values,
             aligned_annot.drop(columns=names),
             dict(aligned_mapping),
             f"`{source}`",
@@ -361,12 +368,14 @@ def move_to_x(
     (a :class:`~pandas.DataFrame` or a 2-D array) whose columns are appended to ``X``;
     columns of an array are named ``f"{key}{i}"``.
 
-    New entries of ``var`` (or ``obs``) are filled with missing values; ``layers``, ``varm``/``obsm``
-    and ``varp``/``obsp`` are padded following the rules of :func:`anndata.concat` with ``join="outer"``
-    (``NaN`` for dense arrays, which may upcast integers to floats, zeros for sparse arrays).
+    New entries of ``var`` (or ``obs``) are filled with missing values; ``layers`` and ``varm``/``obsm``
+    are padded following the rules of :func:`anndata.concat` with ``join="outer"``
+    (``NaN`` for dense arrays, which may upcast integers to floats, zeros for sparse arrays),
+    and ``varp``/``obsp`` become zero-padded sparse matrices.
     ``uns`` is kept. ``raw`` is kept when the observation axis is unchanged,
     otherwise it is dropped with a warning.
-    Only numeric and boolean columns can be moved; categorical and string columns raise an error.
+    Only real numeric and boolean columns can be moved; categorical, string and complex columns raise an error.
+    The object must be in memory (not backed).
 
     .. warning::
        APIs in the experimental module are currently in development and subject to change at any time.
@@ -401,16 +410,22 @@ def move_to_x(
     )
     aligned_axis = 1 - grow_axis
 
-    values, rest_annot, rest_mapping, where = _resolve_source(
-        adata, keys, source=source
-    )
+    # Work on a copy so nothing in the result shares memory with the input.
+    src = adata.copy()
+    aligned_names: pd.Index = getattr(src, f"{aligned_axis_name}_names")
+    if not aligned_names.is_unique:
+        # `concat` aligns the unchanged axis by name; use positional labels and restore below.
+        setattr(
+            src, f"{aligned_axis_name}_names", np.arange(len(aligned_names)).astype(str)
+        )
+    values, rest_annot, rest_mapping, where = _resolve_source(src, keys, source=source)
     new_values = _to_numeric_array(values, where)
 
-    grow_names: pd.Index = getattr(adata, f"{grow_axis_name}_names")
+    grow_names: pd.Index = getattr(src, f"{grow_axis_name}_names")
     if collisions := [c for c in values.columns if c in grow_names]:
         msg = f"`{grow_axis_name}_names` already contain {collisions!r}; cannot move."
         raise ValueError(msg)
-    if not adata._has_X() and adata.shape[grow_axis] > 0:
+    if not src._has_X() and src.shape[grow_axis] > 0:
         msg = (
             "X is None but the object is not empty along the "
             f"`{grow_axis_name}` axis; cannot append to X."
@@ -420,8 +435,7 @@ def move_to_x(
     new_x = new_values if grow_axis == 1 else new_values.T
     new_annot = pd.DataFrame(index=pd.Index(values.columns, name=grow_names.name))
     # Both objects get the same aligned-axis elements, so `merge="first"` keeps them.
-    aligned_pairwise = dict(getattr(adata, f"{aligned_axis_name}p"))
-    src = adata.copy() if adata.is_view else adata
+    aligned_pairwise = dict(getattr(src, f"{aligned_axis_name}p"))
     if aligned_axis == 0:
         new = AnnData(
             X=new_x,
@@ -466,10 +480,12 @@ def move_to_x(
         uns_merge=None,
         pairwise=True,
     )
-    result.uns = deepcopy(dict(adata.uns))
-    if adata.raw is not None:
+    if not aligned_names.is_unique:
+        setattr(result, f"{aligned_axis_name}_names", aligned_names)
+    result.uns = src.uns
+    if src.raw is not None:
         if aligned_axis == 0:
-            result.raw = adata.raw.to_adata()
+            result.raw = src.raw.to_adata()
         else:
             msg = "Moving values to new observations drops `.raw`, as it has no values for them."
             warn(msg, UserWarning)

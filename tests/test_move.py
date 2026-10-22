@@ -9,7 +9,12 @@ from scipy import sparse
 
 import anndata as ad
 from anndata.experimental import move_to_obs, move_to_var, move_to_x
-from anndata.tests.helpers import as_dense_dask_array, assert_equal, gen_adata
+from anndata.tests.helpers import (
+    as_dense_dask_array,
+    assert_equal,
+    gen_adata,
+    shares_memory,
+)
 from anndata.utils import asarray
 
 
@@ -344,7 +349,7 @@ def test_move_to_x_errors():
         move_to_x(adata, "nope")
     with pytest.raises(KeyError, match="'nope' not found in `obsm`"):
         move_to_x(adata, "nope", source="obsm")
-    with pytest.raises(ValueError, match="Only numeric or boolean values"):
+    with pytest.raises(ValueError, match="Only real numeric or boolean values"):
         move_to_x(adata, ["float64", "obs_cat"])
     with pytest.raises(ValueError, match="`source` must be one of"):
         move_to_x(adata, "float64", source="uns")
@@ -403,3 +408,155 @@ def test_round_trip_obsm(adata):
         back.to_df().to_numpy(), adata[:, back.var_names].to_df().to_numpy()
     )
     assert set(back.obsm) == set(adata.obsm)
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: memory sharing, name containers, duplicate names, sparse sources
+# ---------------------------------------------------------------------------
+
+
+def _poke(arr, value=999) -> None:
+    arr[0, 0] = value
+
+
+def _assert_no_shared_memory(res, orig) -> None:
+    for attr in ("obsm", "varm", "obsp", "varp", "layers"):
+        for k, v in getattr(res, attr).items():
+            if k in getattr(orig, attr):
+                assert not shares_memory(v, getattr(orig, attr)[k]), f"{attr}[{k}]"
+
+
+@pytest.mark.parametrize("as_view", [False, True], ids=["actual", "view"])
+def test_move_to_x_does_not_share_memory(*, as_view: bool):
+    adata = gen_adata((6, 4), obsm_types=(np.ndarray,), varm_types=(np.ndarray,))
+    adata.obsp["p"] = np.ones((6, 6))
+    adata.varp["p"] = np.ones((4, 4))
+    adata.raw = adata.copy()
+    orig = adata.copy()
+    inp = adata[:4, :3] if as_view else adata
+    res = move_to_x(inp, "float64")
+    _assert_no_shared_memory(res, adata)
+    _poke(res.obsm["array"])
+    _poke(res.obsp["p"])
+    _poke(res.varm["array"])
+    assert res.raw is not None
+    _poke(res.raw.varm["array"])
+    assert_equal(adata, orig)
+    res_var = move_to_x(inp, "float64", source="var")
+    _assert_no_shared_memory(res_var, adata)
+    _poke(res_var.varm["array"])
+    _poke(res_var.varp["p"])
+    assert_equal(adata, orig)
+
+
+def test_move_to_annot_does_not_share_memory():
+    adata = gen_adata((6, 4), obsm_types=(np.ndarray,), varm_types=(np.ndarray,))
+    orig = adata.copy()
+    res = move_to_obs(adata[:4], "gene0")
+    _assert_no_shared_memory(res, adata)
+    _poke(res.obsm["array"])
+    assert_equal(adata, orig)
+
+
+@pytest.mark.parametrize(
+    "make_keys",
+    [
+        pytest.param(lambda names: names[[1, 3]], id="pd.Index"),
+        pytest.param(lambda names: np.array(names[[1, 3]]), id="np.str_array"),
+        pytest.param(lambda names: pd.Series(names[[1, 3]]), id="pd.Series"),
+        pytest.param(lambda names: tuple(names[[1, 3]]), id="tuple"),
+        pytest.param(lambda names: names.isin(names[[1, 3]]), id="np.bool_mask"),
+        pytest.param(
+            lambda names: pd.Series(names.isin(names[[1, 3]])), id="pd.bool_mask"
+        ),
+    ],
+)
+def test_move_to_annot_key_containers(make_keys):
+    adata = gen_adata((6, 5), obsm_types=(), varm_types=())
+    res = move_to_obs(adata, make_keys(adata.var_names))
+    assert res.n_vars == 3
+    assert {"gene1", "gene3"} <= set(res.obs.columns)
+    res_var = move_to_var(adata, make_keys(adata.obs_names))
+    assert res_var.n_obs == 4
+    assert {"cell1", "cell3"} <= set(res_var.var.columns)
+    # a list of booleans is a mask, too
+    assert move_to_obs(adata, [False, True, False, True, False]).n_vars == 3
+
+
+@pytest.mark.parametrize("source", ["obs", "var"])
+def test_move_to_x_duplicate_aligned_names(source):
+    adata = ad.AnnData(np.arange(12.0).reshape(3, 4))
+    if source == "obs":
+        adata.obs_names = ["x", "x", "y"]
+        adata.obs["a"] = [1.0, 2.0, 3.0]
+        adata.obsm["m"] = pd.DataFrame({"c": [7.0, 8.0, 9.0]}, index=adata.obs_names)
+    else:
+        adata.var_names = ["x", "x", "y", "z"]
+        adata.var["a"] = [1.0, 2.0, 3.0, 4.0]
+    res = move_to_x(adata, "a", source=source)
+    if source == "obs":
+        assert res.obs_names.tolist() == ["x", "x", "y"]
+        assert res.var_names.tolist() == ["0", "1", "2", "3", "a"]
+        np.testing.assert_array_equal(res.to_df()["a"], [1.0, 2.0, 3.0])
+        m = res.obsm["m"]
+        assert isinstance(m, pd.DataFrame)
+        assert m.index.tolist() == ["x", "x", "y"]
+        np.testing.assert_array_equal(m["c"], [7.0, 8.0, 9.0])
+        # round trip
+        back = move_to_obs(res, "a")
+        assert back.obs_names.tolist() == ["x", "x", "y"]
+        np.testing.assert_array_equal(back.obs["a"], [1.0, 2.0, 3.0])
+    else:
+        assert res.var_names.tolist() == ["x", "x", "y", "z"]
+        assert res.obs_names.tolist() == ["0", "1", "2", "a"]
+        np.testing.assert_array_equal(res.to_df().loc["a"], [1.0, 2.0, 3.0, 4.0])
+        back = move_to_var(res, "a")
+        assert back.var_names.tolist() == ["x", "x", "y", "z"]
+
+
+@pytest.mark.parametrize(
+    "to_sparse", [sparse.csr_matrix, sparse.csc_array], ids=["csr_matrix", "csc_array"]
+)
+def test_move_to_x_from_sparse_mapping(to_sparse):
+    adata = gen_adata((5, 3), obsm_types=(), varm_types=())
+    values = np.arange(10.0).reshape(5, 2)
+    adata.obsm["prot"] = to_sparse(values)
+    res = move_to_x(adata, "prot", source="obsm")
+    assert res.var_names.tolist() == [*adata.var_names, "prot0", "prot1"]
+    np.testing.assert_array_equal(asarray(res.X)[:, 3:], values)
+    adata.varm["load"] = to_sparse(np.ones((3, 2)))
+    res_var = move_to_x(adata, "load", source="varm")
+    np.testing.assert_array_equal(asarray(res_var.X)[5:], np.ones((2, 3)))
+
+
+def test_move_to_x_pairwise_padding():
+    adata = gen_adata((4, 3), obsm_types=(), varm_types=())
+    adata.varp["dense"] = np.arange(9.0).reshape(3, 3)
+    adata.obsp["dense"] = np.arange(16.0).reshape(4, 4)
+    res = move_to_x(adata, "float64")
+    varp = res.varp["dense"]
+    assert varp.shape == (4, 4)
+    np.testing.assert_array_equal(asarray(varp)[:3, :3], adata.varp["dense"])
+    assert (asarray(varp)[3, :] == 0).all()
+    assert (asarray(varp)[:, 3] == 0).all()
+    np.testing.assert_array_equal(asarray(res.obsp["dense"]), adata.obsp["dense"])
+
+
+def test_move_to_x_validation_of_labels():
+    adata = gen_adata((5, 3), obsm_types=(), varm_types=())
+    adata.obsm["mixed"] = pd.DataFrame(
+        np.ones((5, 2)), index=adata.obs_names, columns=[1, "1"]
+    )
+    with pytest.raises(ValueError, match="must be unique \\(as strings\\)"):
+        move_to_x(adata, "mixed", source="obsm")
+    adata.obsm["empty"] = np.ones((5, 0))
+    with pytest.raises(ValueError, match="has no columns to move"):
+        move_to_x(adata, "empty", source="obsm")
+    adata.obs = pd.DataFrame(
+        np.ones((5, 2)), index=adata.obs_names, columns=["dup", "dup"]
+    )
+    with pytest.raises(ValueError, match="not unique: \\['dup'\\] is ambiguous"):
+        move_to_x(adata, "dup")
+    adata.obs = pd.DataFrame({"c": np.ones(5, dtype=complex)}, index=adata.obs_names)
+    with pytest.raises(ValueError, match="Only real numeric or boolean"):
+        move_to_x(adata, "c")
